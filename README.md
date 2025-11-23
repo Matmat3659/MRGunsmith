@@ -16,6 +16,7 @@ basic usage's
 
 prepair a dataset as sutch, this is what i usually do but you may automate it
 make a folder with this structure, and a tags.json
+
 data/
  - i1/
  - i2/
