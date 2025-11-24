@@ -530,15 +530,22 @@ struct MaxPool {
     int padding;
     // Stores the (i, j) coordinates of the maximum value for each output cell
     std::vector<std::vector<std::vector<std::pair<int,int>>>> maxPos;
+    // FIX: Cache the original input dimensions for the backward pass
+    int lastH;
+    int lastW;
 
     MaxPool(int poolSize_ = 2, int stride_ = 2, int padding_ = 0)
-        : poolSize(poolSize_), stride(stride_), padding(padding_) {}
+        : poolSize(poolSize_), stride(stride_), padding(padding_), lastH(0), lastW(0) {}
 
     std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input)
     {
         int F = input.size();
         int H = input[0].size();
         int W = input[0][0].size();
+        // FIX: Store input dimensions
+        lastH = H;
+        lastW = W;
+
         int outH = (H + 2*padding - poolSize) / stride + 1;
         int outW = (W + 2*padding - poolSize) / stride + 1;
 
@@ -570,23 +577,26 @@ struct MaxPool {
         return out;
     }
 
-    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, int origH, int origW)
+    // FIX: Removed origH, origW arguments and using cached lastH, lastW instead.
+    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut)
     {
         int F = dOut.size();
-        int outH = dOut[0].size();
-        int outW = dOut[0][0].size();
+        // Use cached dimensions
+        int origH = lastH;
+        int origW = lastW;
 
         std::vector<std::vector<std::vector<float>>> dInput(
             F, std::vector<std::vector<float>>(origH, std::vector<float>(origW, 0)));
 
         #pragma omp parallel for
         for(int f = 0; f < F; f++){
-            for(int i = 0; i < outH; i++){
-                for(int j = 0; j < outW; j++){
+            for(size_t i = 0; i < dOut[0].size(); i++){ // outH
+                for(size_t j = 0; j < dOut[0][0].size(); j++){ // outW
                     // Use std::tie to extract the coordinates
                     int pi, pj;
                     std::tie(pi, pj) = maxPos[f][i][j];
-                    if(pi >= 0 && pj >= 0)
+                    // Bounds check is technically only needed if maxPos could be outside origH/origW, but good practice
+                    if(pi >= 0 && pj >= 0 && pi < origH && pj < origW)
                         dInput[f][pi][pj] = dOut[f][i][j];
                 }
             }
@@ -789,6 +799,60 @@ vector<vector<vector<float>>> load_image_resized(string path, int targetSize){
     return out;
 }
 
+// Type alias for clarity
+using Image = vector<vector<vector<float>>>;
+
+// ---------------- Compose augmentation ---------------- //
+Image augment_image(const Image& img) {
+    // Thread-local RNG for OpenMP safety
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+
+    Image out = img;
+    // Assuming input image is [C][H][W] from load_image_resized output.
+    int C = img.size();
+    int H = img[0].size();
+    int W = img[0][0].size();
+    
+    // We must handle image format C x H x W instead of H x W x C
+    if (C != 3) { /* Handle error or different channel count if needed */ }
+
+    // ---- Horizontal Flip ----
+    if (uniform(rng) < 0.5f) {
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W / 2; w++)
+                    std::swap(out[c][h][w], out[c][h][W - 1 - w]);
+    }
+
+    // ---- Rotate 90 degrees clockwise ----
+    if (uniform(rng) < 0.5f) {
+        Image rotated(C, vector<vector<float>>(W, vector<float>(H)));
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++)
+                    rotated[c][w][H - 1 - h] = out[c][h][w];
+        out = std::move(rotated);
+        std::swap(H, W); // Update height and width after rotation
+    }
+
+    // ---- Color jitter (brightness + contrast) ----
+    float brightness = 0.2f;
+    float contrast = 0.2f;
+    float b = (uniform(rng) * 2 - 1) * brightness; // [-brightness, brightness]
+    float c = 1.0f + (uniform(rng) * 2 - 1) * contrast; // [1-contrast, 1+contrast]
+
+    for (int ch = 0; ch < C; ch++)
+        for (int h = 0; h < H; h++)
+            for (int w = 0; w < W; w++) {
+                float val = out[ch][h][w] * c + b;
+                // Clamping range is [-1, 1] because image is normalized to [-1, 1]
+                out[ch][h][w] = std::min(std::max(val, -1.0f), 1.0f); 
+            }
+
+    return out;
+}
+
 void load_dataset(const string& folder,
                   vector<vector<vector<vector<float>>>>& X,
                   vector<vector<float>>& Y,
@@ -811,6 +875,8 @@ void load_dataset(const string& folder,
             string path = folder + "/" + f.key() + "/" + img.key();
             // Use the renamed/updated image loading function
             auto imgRGB = load_image_resized(path, targetSize);
+            // Augment image after resizing
+            imgRGB = augment_image(imgRGB);
             X.push_back(imgRGB);
 
             vector<float> multi(tag2idx.size(), 0.0f);
@@ -891,6 +957,7 @@ int main(int argc,char **argv){
 
     // Classifier Head
     int fcInputSize = 0;
+    int feature_H = 0, feature_W = 0; // Capture spatial dimensions for logging
     // Dry run forward pass to calculate the input size for the FC layer
     {
         auto s = stem_conv.forward(X[0]);
@@ -899,13 +966,16 @@ int main(int argc,char **argv){
         s = downsample2.forward(s);
         s = expand2.forward(s);
         s = block2.forward(s);
-        fcInputSize = s.size() * s[0].size() * s[0][0].size();
+        
+        feature_H = s[0].size();
+        feature_W = s[0][0].size();
+        fcInputSize = s.size() * feature_H * feature_W;
     }
     // Final layer is SIGMOID for multi-label classification
     FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID);
 
     cout << "Network initialized.\n";
-    cout << "Output feature map size (before flattening): " << C2 << "x" << sqrt(fcInputSize / C2) << "x" << sqrt(fcInputSize / C2) << endl;
+    cout << "Output feature map size (before flattening): " << C2 << "x" << feature_H << "x" << feature_W << endl;
     cout << "Input size to FC: " << fcInputSize << " (C="<< C2 <<")\n";
 
     // ---------------- Training loop ----------------
@@ -939,13 +1009,12 @@ int main(int argc,char **argv){
                 auto s = stem_conv.forward(batch_inputs[b]);
                 s = stem_ln.forward(s);
                 s = block1.forward(s);
-                int h1 = s[0].size(); int w1 = s[0][0].size();
-
+                // No need to store sizes here, MaxPool handles it internally now.
+                
                 s = downsample2.forward(s);
                 s = expand2.forward(s);
                 s = block2.forward(s);
-                int h2 = s[0].size(); int w2 = s[0][0].size();
-
+                
                 auto flat = flatten(s);
                 auto pred = classifier.forward(flat);
 
@@ -975,11 +1044,14 @@ int main(int argc,char **argv){
                 auto dFlat = classifier.backward(all_dInput_fc[b], lr / currentBatchSize); // Divide LR by batch size for averaging
 
                 // Unflatten and Backprop Conv Blocks
-                auto dConv = unflatten(dFlat, C2, block2.dwConv.lastInput[0].size(), block2.dwConv.lastInput[0][0].size());
+                // The size needed for unflatten is the same as calculated in the dry run: C2 x feature_H x feature_W
+                auto dConv = unflatten(dFlat, C2, feature_H, feature_W);
 
                 dConv = block2.backward(dConv, lr / currentBatchSize);
                 dConv = expand2.backward(dConv, lr / currentBatchSize);
-                dConv = downsample2.backward(dConv, block1.dwConv.lastInput[0].size(), block1.dwConv.lastInput[0][0].size());
+                
+                // FIX: MaxPool backward now uses the new signature (no size arguments)
+                dConv = downsample2.backward(dConv); 
 
                 dConv = block1.backward(dConv, lr / currentBatchSize);
                 dConv = stem_ln.backward(dConv, lr / currentBatchSize);
