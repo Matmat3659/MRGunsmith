@@ -6,11 +6,11 @@ Compile guide
 
 for the trainer
 ``` trainer
-clang++ trainer.cpp -o trn -fopenmp
+clang++ -fopenmp -O3 trainer.cpp -o trn -fopenmp
 ```
 and for the runner
 ``` runner
-clang++ interferer.cpp -o runner -fopenmp
+clang++ -fopenmp -O3 interferer.cpp -o runner -fopenmp
 ```
 basic usage's
 
@@ -46,6 +46,16 @@ the trainer can be started with
 ```
 but i recommend making a dedicated folder, then calling trn there, since it will output a lot of .bin
 weights whitch can get overwhelming, like
+
+```
+./preprocessor <in> <out> <size>
+```
+or
+```
+./preprocessor folder/dataset folder/datasetout 256
+```
+the dataset is still the same, its just preprocessed
+
 ```
 mkdir model1
 cd model1
@@ -56,7 +66,7 @@ flags thingy
 ```
 --data
 ```
-sets where the data folder is containing the tags.json and its folders
+sets where the folder where the dataset.bin and tags.json are in that was outputted by the preprocessor
 ```
 --epoch
 ```

@@ -886,66 +886,6 @@ void load_dataset(const string& folder,
         }
 }
 
-struct Dataset {
-    vector<vector<vector<vector<float>>>> X; // [N][C][H][W]
-    vector<vector<float>> Y;                 // [N][num_labels]
-    int N, C, H, W, num_labels;
-};
-
-Dataset load_dataset_bin(const string& folder_path, map<string,int>& tag2idx) {
-    Dataset data;
-
-    // Tags file
-    string tag_file = folder_path + "/tags.json";
-    ifstream ftag(tag_file);
-    if(!ftag.is_open()){
-        cerr << "Cannot open tag file " << tag_file << "\n"; 
-        exit(1);
-    }
-
-    json j; 
-    ftag >> j;
-    tag2idx.clear();
-    for(auto &item: j.items()) 
-        tag2idx[item.key()] = item.value();
-    ftag.close();
-
-    // Dataset file
-    string bin_path = folder_path + "/dataset.bin";
-    ifstream fin(bin_path, ios::binary);
-    if(!fin.is_open()){ 
-        cerr << "Cannot open dataset file " << bin_path << "\n"; 
-        exit(1); 
-    }
-
-    // Read header
-    fin.read((char*)&data.N, sizeof(int));
-    fin.read((char*)&data.C, sizeof(int));
-    fin.read((char*)&data.H, sizeof(int));
-    fin.read((char*)&data.W, sizeof(int));
-    fin.read((char*)&data.num_labels, sizeof(int));
-
-    data.X.resize(data.N, vector<vector<vector<float>>>(data.C, vector<vector<float>>(data.H, vector<float>(data.W))));
-    data.Y.resize(data.N, vector<float>(data.num_labels));
-
-    for(int i=0;i<data.N;i++){
-        for(int c=0;c<data.C;c++)
-            for(int h=0;h<data.H;h++)
-                for(int w=0;w<data.W;w++)
-                    fin.read((char*)&data.X[i][c][h][w], sizeof(float));
-
-        for(int l=0;l<data.num_labels;l++)
-            fin.read((char*)&data.Y[i][l], sizeof(float));
-    }
-
-    fin.close();
-    cout << "Loaded " << data.N << " images of size " 
-         << data.C << "x" << data.H << "x" << data.W 
-         << " with " << data.num_labels << " labels.\n";
-
-    return data;
-}
-
 float multilabel_accuracy(const vector<float>& pred, const vector<float>& target, float threshold=0.5f){
     int correct=0, total=0;
     for(size_t i=0; i<pred.size(); i++){
@@ -959,73 +899,66 @@ float multilabel_accuracy(const vector<float>& pred, const vector<float>& target
 
 // ---------------- MAIN ----------------
 int main(int argc,char **argv){
-    // Seed RNGs
+    // Use current time for seeding random number generator
     srand(time(0));
     random_device rd; mt19937 g(rd());
 
     vector<vector<vector<vector<float>>>> X; // Dataset images
-    vector<vector<float>> Y;                 // Dataset labels
-    map<string,int> tag2idx;                 // Tag name to index
+    vector<vector<float>> Y; // Dataset labels
+    map<string,int> tag2idx; // Tag name to index mapping
 
-    string dataFolder = "Data";  // Folder containing dataset.bin and tags.json
-    int epochs = 50;
-    float lr = 0.005f;
-    int batchSize = 2;
+    string dataFolder="Data";
+    int epochs=50;
+    float lr=0.005f;
+    int batchSize=2;
     int numThreads = 4;
+    // --- UPGRADE: Increased default image size from 64 to 128 ---
     int imageSize = 128;
 
-    // Command line arguments
+    // Command line argument parsing
     for(int i=1;i<argc;i++){
         string arg=argv[i];
-        if(arg=="--data" && i+1<argc){ dataFolder = argv[i+1]; i++; }
-        else if(arg=="--epochs" && i+1<argc){ epochs = stoi(argv[i+1]); i++; }
-        else if(arg=="--lr" && i+1<argc){ lr = stof(argv[i+1]); i++; }
-        else if(arg=="--batch" && i+1<argc){ batchSize = stoi(argv[i+1]); i++; }
+        if(arg=="--data" && i+1<argc){ dataFolder=argv[i+1]; i++; }
+        else if(arg=="--epochs" && i+1<argc){ epochs=stoi(argv[i+1]); i++; }
+        else if(arg=="--lr" && i+1<argc){ lr=stof(argv[i+1]); i++; }
+        else if(arg=="--batch" && i+1<argc){ batchSize=stoi(argv[i+1]); i++; }
         else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
+        else if(arg=="--size" && i+1<argc){ imageSize = stoi(argv[i+1]); i++; } // New option to override size
     }
 
     omp_set_num_threads(numThreads);
     cout << "Using " << numThreads << " OpenMP threads\n";
-    cout << "Batch size set to: " << batchSize << endl;
 
-    // ---------------- Load dataset ----------------
-    cout << "Loading dataset from folder: " << dataFolder << "\n";
-    Dataset data = load_dataset_bin(dataFolder, tag2idx);
-    X = std::move(data.X);
-    Y = std::move(data.Y);
-    imageSize = data.H;
+    cout<<"Loading data from folder: "<<dataFolder<<" (Target size: "<<imageSize<<"x"<<imageSize<<")\n";
+    load_dataset(dataFolder, X, Y, tag2idx, imageSize);
+    cout<<"Loaded "<<X.size()<<" images, "<<tag2idx.size()<<" tags.\n";
 
-    // ---------------- Check data ----------------
     if (X.empty()) {
         cerr << "Error: No data loaded. Exiting.\n";
         return 1;
     }
 
-    // --- ConvNeXt Base-like Architecture ---
-    const int C1 = 64;
-    const int C2 = 128;
-    const int C3 = 256;
-    const int C4 = 512;
+    // --- ConvNeXt Tiny-like Architecture (Simplified) ---
+    // The architecture is now more robust for 128x128 input.
 
+    // Stage 1: Stem and first block (3 -> C1 channels)
+    const int C1 = 24; // Initial channel width
+    // Stem: 4x4 Conv, stride 4. Reduces 128x128 -> 32x32
     ConvLayer stem_conv(3, 4, C1, Activation::IDENTITY, 4, 0, 1);
     LayerNorm stem_ln(C1);
     ConvNeXtBlock block1(C1);
 
+    // Stage 2: Downsampling and second block (C1 -> C2 channels)
+    const int C2 = 48; // Second channel width
+    // Downsample: MaxPool 2x2, stride 2. Reduces 32x32 -> 16x16
     MaxPool downsample2(2, 2);
-    ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1);
+    ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1); // Expand channels C1 -> C2
     ConvNeXtBlock block2(C2);
 
-    MaxPool downsample3(2, 2);
-    ConvLayer expand3(C2, 1, C3, Activation::IDENTITY, 1, 0, 1);
-    ConvNeXtBlock block3(C3);
-
-    MaxPool downsample4(2, 2);
-    ConvLayer expand4(C3, 1, C4, Activation::IDENTITY, 1, 0, 1);
-    ConvNeXtBlock block4(C4);
-
-    // Dry run to compute FC input size
+    // Classifier Head
     int fcInputSize = 0;
-    int feature_H=0, feature_W=0;
+    int feature_H = 0, feature_W = 0; // Capture spatial dimensions for logging
+    // Dry run forward pass to calculate the input size for the FC layer
     {
         auto s = stem_conv.forward(X[0]);
         s = stem_ln.forward(s);
@@ -1033,130 +966,125 @@ int main(int argc,char **argv){
         s = downsample2.forward(s);
         s = expand2.forward(s);
         s = block2.forward(s);
-        s = downsample3.forward(s);
-        s = expand3.forward(s);
-        s = block3.forward(s);
-        s = downsample4.forward(s);
-        s = expand4.forward(s);
-        s = block4.forward(s);
-
+        
         feature_H = s[0].size();
         feature_W = s[0][0].size();
         fcInputSize = s.size() * feature_H * feature_W;
     }
-
+    // Final layer is SIGMOID for multi-label classification
     FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID);
-    string modelName = "convnext_base";
 
-    cout << "Network initialized. Output feature map: " << C4 << "x" << feature_H << "x" << feature_W << "\n";
-    cout << "Input size to FC: " << fcInputSize << " (C=" << C4 << ")\n";
+    cout << "Network initialized.\n";
+    cout << "Output feature map size (before flattening): " << C2 << "x" << feature_H << "x" << feature_W << endl;
+    cout << "Input size to FC: " << fcInputSize << " (C="<< C2 <<")\n";
 
     // ---------------- Training loop ----------------
     for(int e=0; e<epochs; e++){
         float totalLoss = 0;
 
-        // Shuffle indices
+        // Shuffle the data for better stochasticity
         vector<int> indices(X.size());
         iota(indices.begin(), indices.end(), 0);
         shuffle(indices.begin(), indices.end(), g);
 
-        for(size_t i=0;i<X.size();i+=batchSize){
-            vector<vector<vector<vector<float>>>> batch_inputs;
-            vector<vector<float>> batch_targets;
+        for(size_t i=0; i<X.size(); i += batchSize){
+            // Mini-batch processing
             vector<vector<float>> batch_preds;
-            vector<vector<float>> all_dInput_fc;
+            vector<vector<float>> batch_targets;
+            vector<vector<vector<vector<float>>>> batch_inputs;
+            vector<float> avg_loss_grads(tag2idx.size(), 0.0f);
 
             int currentBatchSize = 0;
-            for(int b=0;b<batchSize && i+b<X.size();b++){
-                int idx = indices[i+b];
+            for (int b = 0; b < batchSize && i + b < X.size(); ++b) {
+                int idx = indices[i + b];
                 batch_inputs.push_back(X[idx]);
                 batch_targets.push_back(Y[idx]);
                 currentBatchSize++;
             }
 
-            // Forward pass
-            for(int b=0;b<currentBatchSize;b++){
+            // --- Forward Pass (Batch size 1 for now, or process sequentially) ---
+            vector<vector<float>> all_dInput_fc; // Gradients from FC to Conv
+            for (int b = 0; b < currentBatchSize; ++b) {
+                // Fwd
                 auto s = stem_conv.forward(batch_inputs[b]);
                 s = stem_ln.forward(s);
                 s = block1.forward(s);
+                // No need to store sizes here, MaxPool handles it internally now.
+                
                 s = downsample2.forward(s);
                 s = expand2.forward(s);
                 s = block2.forward(s);
-                s = downsample3.forward(s);
-                s = expand3.forward(s);
-                s = block3.forward(s);
-                s = downsample4.forward(s);
-                s = expand4.forward(s);
-                s = block4.forward(s);
-
+                
                 auto flat = flatten(s);
                 auto pred = classifier.forward(flat);
+
                 batch_preds.push_back(pred);
 
+                // Calculate Loss and Gradient w.r.t classifier output (dL/dz)
                 auto grad_fc = BCE_grad(pred, batch_targets[b]);
-                for(size_t k=0;k<pred.size();k++){
+                
+                // Binary Cross Entropy Loss calculation
+                for(size_t k=0; k<pred.size(); k++){
                     float p_k = std::clamp(pred[k], 1e-7f, 1.0f-1e-7f);
-                    totalLoss += batch_targets[b][k] > 0.5f ? -std::log(p_k) : -std::log(1.0f-p_k);
+                    if(batch_targets[b][k] > 0.5f){
+                        totalLoss += -std::log(p_k);
+                    } else {
+                        totalLoss += -std::log(1.0f - p_k);
+                    }
                 }
+
+                // Accumulate gradients for the backward pass
                 all_dInput_fc.push_back(grad_fc);
             }
 
-            // Backward pass
-            for(int b=0;b<currentBatchSize;b++){
-                auto dFlat = classifier.backward(all_dInput_fc[b], lr/currentBatchSize);
-                auto dConv = unflatten(dFlat, C4, feature_H, feature_W);
+            // --- Backward Pass ---
+            // Process the batch in reverse, applying gradient averaging implicitly through the learning rate scale
+            for (int b = 0; b < currentBatchSize; ++b) {
+                // Backprop FC
+                auto dFlat = classifier.backward(all_dInput_fc[b], lr / currentBatchSize); // Divide LR by batch size for averaging
 
-                dConv = block4.backward(dConv, lr/currentBatchSize);
-                dConv = expand4.backward(dConv, lr/currentBatchSize);
-                dConv = downsample4.backward(dConv);
+                // Unflatten and Backprop Conv Blocks
+                // The size needed for unflatten is the same as calculated in the dry run: C2 x feature_H x feature_W
+                auto dConv = unflatten(dFlat, C2, feature_H, feature_W);
 
-                dConv = block3.backward(dConv, lr/currentBatchSize);
-                dConv = expand3.backward(dConv, lr/currentBatchSize);
-                dConv = downsample3.backward(dConv);
+                dConv = block2.backward(dConv, lr / currentBatchSize);
+                dConv = expand2.backward(dConv, lr / currentBatchSize);
+                
+                // FIX: MaxPool backward now uses the new signature (no size arguments)
+                dConv = downsample2.backward(dConv); 
 
-                dConv = block2.backward(dConv, lr/currentBatchSize);
-                dConv = expand2.backward(dConv, lr/currentBatchSize);
-                dConv = downsample2.backward(dConv);
-
-                dConv = block1.backward(dConv, lr/currentBatchSize);
-                dConv = stem_ln.backward(dConv, lr/currentBatchSize);
-                dConv = stem_conv.backward(dConv, lr/currentBatchSize);
+                dConv = block1.backward(dConv, lr / currentBatchSize);
+                dConv = stem_ln.backward(dConv, lr / currentBatchSize);
+                dConv = stem_conv.backward(dConv, lr / currentBatchSize);
             }
         }
 
-        // Epoch metrics
+        // --- Epoch End Metrics ---
         float avgLoss = totalLoss / X.size();
         float avgAcc = 0;
-        for(size_t i=0;i<X.size();i++){
+        for(size_t i=0; i<X.size(); i++){
+            // Run a quick inference (no backprop/dropout)
             auto s = stem_conv.forward(X[i]);
             s = stem_ln.forward(s);
             s = block1.forward(s);
             s = downsample2.forward(s);
             s = expand2.forward(s);
             s = block2.forward(s);
-            s = downsample3.forward(s);
-            s = expand3.forward(s);
-            s = block3.forward(s);
-            s = downsample4.forward(s);
-            s = expand4.forward(s);
-            s = block4.forward(s);
             auto pred = classifier.forward(flatten(s), false);
-            avgAcc += multilabel_accuracy(pred,Y[i]);
+            avgAcc += multilabel_accuracy(pred, Y[i]);
         }
         avgAcc /= X.size();
+
         cout << "Epoch " << e+1 << "/" << epochs << ": Loss = " << avgLoss << ", Accuracy = " << avgAcc << endl;
     }
 
     // --- Save Model ---
+    string modelName = "convnext_model";
     stem_conv.save(modelName + "_stem_conv");
     stem_ln.save(modelName + "_stem_ln");
     block1.save(modelName + "_block1");
     expand2.save(modelName + "_expand2");
     block2.save(modelName + "_block2");
-    expand3.save(modelName + "_expand3");
-    block3.save(modelName + "_block3");
-    expand4.save(modelName + "_expand4");
-    block4.save(modelName + "_block4");
     classifier.save(modelName + "_fc");
     save_tags(tag2idx, modelName);
 
