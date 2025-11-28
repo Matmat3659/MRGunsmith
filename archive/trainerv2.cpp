@@ -701,32 +701,7 @@ struct FCLayer {
 
         return dInput;
     }
-    
-    void expandOutputs(int newOutSize) {
-        if(newOutSize <= outSize) return;
-    
-        std::vector<std::vector<float>> newW(newOutSize, std::vector<float>(inSize));
-        std::vector<float> newB(newOutSize, 0.0f);
-        
-        for(int i=0;i<outSize;i++){
-            for(int j=0;j<inSize;j++)
-                newW[i][j] = W[i][j];
-            newB[i] = B[i];
-        }
-        
-        for(int i=outSize;i<newOutSize;i++){
-            for(int j=0;j<inSize;j++)
-                newW[i][j] = xavier_init(inSize, newOutSize);
-            newB[i] = 0.0f;
-        }
-    
-        W = std::move(newW);
-        B = std::move(newB);
-        outSize = newOutSize;
-    
-        std::cout << "FC layer expanded to " << outSize << " outputs.\n";
-    }
-    
+
     void save(const std::string& prefix){
         std::ofstream wfile(prefix + "_weights.bin", std::ios::binary);
         for(auto &row: W)
@@ -754,7 +729,10 @@ struct FCLayer {
 vector<float> BCE_grad(const vector<float>& p, const vector<float>& t){
     vector<float> g(p.size());
     for(size_t i=0;i<p.size();i++){
+        // p is the output of sigmoid (post-activation)
         float pi = std::clamp(p[i], 1e-7f, 1.0f-1e-7f);
+        // This is dL/dz where z is the pre-sigmoid output (Wz+b)
+        // dL/dz = (p - t)
         g[i] = pi - t[i];
     }
     return g;
@@ -779,31 +757,39 @@ void load_tags(map<string,int>& tag2idx, const string& prefix){
     f.close();
 }
 
-
+// Renamed from load_image_64 to be more general for any target size
 vector<vector<vector<float>>> load_image_resized(string path, int targetSize){
     int w, h, c;
+    // Load image as 3 channels (RGB)
     unsigned char* img = stbi_load(path.c_str(), &w, &h, &c, 3);
     if(!img){ cerr << "Failed to load " << path << endl; exit(1); }
-    
+
+    // Output is [3][targetSize][targetSize]
     vector<vector<vector<float>>> out(3, vector<vector<float>>(targetSize, vector<float>(targetSize, 0)));
     const float inv255 = 1.0f / 255.0f;
-    
+
+    // Simple Bilinear Interpolation for Resizing
     for(int i=0; i<targetSize; i++){
+        // Map target pixel i to source float coordinate fx (scaled from h-1)
         float fx = i * (h-1.0f)/(targetSize-1.0f); int x0 = (int)fx, x1 = min(x0+1, h-1); float dx = fx - x0;
         for(int j=0; j<targetSize; j++){
+            // Map target pixel j to source float coordinate fy (scaled from w-1)
             float fy = j * (w-1.0f)/(targetSize-1.0f); int y0 = (int)fy, y1 = min(y0+1, w-1); float dy = fy - y0;
 
             for(int ch=0; ch<3; ch++){
+                // Get 4 surrounding pixels (normalized 0-1)
                 float v00 = img[(x0*w + y0)*3 + ch]*inv255;
                 float v01 = img[(x0*w + y1)*3 + ch]*inv255;
                 float v10 = img[(x1*w + y0)*3 + ch]*inv255;
                 float v11 = img[(x1*w + y1)*3 + ch]*inv255;
-                
+
+                // Bilinear interpolation
                 out[ch][i][j] = (1-dx)*(1-dy)*v00 + (1-dx)*dy*v01 + dx*(1-dy)*v10 + dx*dy*v11;
             }
         }
     }
-    
+
+    // Normalization to [-1, 1] range
     for(int ch=0; ch<3; ch++)
         for(int i=0; i<targetSize; i++)
             for(int j=0; j<targetSize; j++)
@@ -813,18 +799,22 @@ vector<vector<vector<float>>> load_image_resized(string path, int targetSize){
     return out;
 }
 
+// Type alias for clarity
 using Image = vector<vector<vector<float>>>;
 
 // ---------------- Compose augmentation ---------------- //
 Image augment_image(const Image& img) {
+    // Thread-local RNG for OpenMP safety
     thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
 
     Image out = img;
+    // Assuming input image is [C][H][W] from load_image_resized output.
     int C = img.size();
     int H = img[0].size();
     int W = img[0][0].size();
     
+    // We must handle image format C x H x W instead of H x W x C
     if (C != 3) { /* Handle error or different channel count if needed */ }
 
     // ---- Horizontal Flip ----
@@ -856,6 +846,7 @@ Image augment_image(const Image& img) {
         for (int h = 0; h < H; h++)
             for (int w = 0; w < W; w++) {
                 float val = out[ch][h][w] * c + b;
+                // Clamping range is [-1, 1] because image is normalized to [-1, 1]
                 out[ch][h][w] = std::min(std::max(val, -1.0f), 1.0f); 
             }
 
@@ -976,9 +967,7 @@ int main(int argc,char **argv){
     vector<vector<float>> Y;                 // Dataset labels
     map<string,int> tag2idx;                 // Tag name to index
 
-    string dataFolder = "Data";
-    string loadModelFolder = "";
-    bool freeze_base = false;
+    string dataFolder = "Data";  // Folder containing dataset.bin and tags.json
     int epochs = 50;
     float lr = 0.005f;
     int batchSize = 2;
@@ -993,8 +982,6 @@ int main(int argc,char **argv){
         else if(arg=="--lr" && i+1<argc){ lr = stof(argv[i+1]); i++; }
         else if(arg=="--batch" && i+1<argc){ batchSize = stoi(argv[i+1]); i++; }
         else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
-        else if(arg=="--load-model" && i+1<argc){ loadModelFolder = argv[i+1]; i++; }
-        else if(arg=="--size" && i+1<argc){ imageSize = stoi(argv[i+1]); i++; }
     }
 
     omp_set_num_threads(numThreads);
@@ -1061,40 +1048,6 @@ int main(int argc,char **argv){
     FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID);
     string modelName = "convnext_base";
 
-    // --- Load model for incremental training if folder specified ---
-    if(!loadModelFolder.empty()) {
-        cout << "Loading model from folder: " << loadModelFolder << "\n";
-    
-        // Load ConvNeXt base layers
-        stem_conv.load(loadModelFolder + "/stem_conv");
-        stem_ln.load(loadModelFolder + "/stem_ln");
-        block1.load(loadModelFolder + "/block1");
-        expand2.load(loadModelFolder + "/expand2");
-        block2.load(loadModelFolder + "/block2");
-        expand3.load(loadModelFolder + "/expand3");
-        block3.load(loadModelFolder + "/block3");
-        expand4.load(loadModelFolder + "/expand4");
-        block4.load(loadModelFolder + "/block4");
-        classifier.load(loadModelFolder + "/fc");
-        
-        map<string,int> oldTags;
-        load_tags(oldTags, loadModelFolder + "/" + modelName);
-    
-        for(auto &p : oldTags){
-            if(tag2idx.find(p.first) == tag2idx.end()){
-                tag2idx[p.first] = tag2idx.size();
-            }
-        }
-    
-        freeze_base = true;
-    }
-    
-    int oldFCsize = classifier.outSize;
-    int newFCsize = tag2idx.size();
-    if(newFCsize > oldFCsize){
-        classifier.expandOutputs(newFCsize);
-    }
-    
     cout << "Network initialized. Output feature map: " << C4 << "x" << feature_H << "x" << feature_W << "\n";
     cout << "Input size to FC: " << fcInputSize << " (C=" << C4 << ")\n";
 
@@ -1153,23 +1106,21 @@ int main(int argc,char **argv){
                 auto dFlat = classifier.backward(all_dInput_fc[b], lr/currentBatchSize);
                 auto dConv = unflatten(dFlat, C4, feature_H, feature_W);
 
-                if(!freeze_base) {
-                    dConv = block4.backward(dConv, lr/currentBatchSize);
-                    dConv = expand4.backward(dConv, lr/currentBatchSize);
-                    dConv = downsample4.backward(dConv);
+                dConv = block4.backward(dConv, lr/currentBatchSize);
+                dConv = expand4.backward(dConv, lr/currentBatchSize);
+                dConv = downsample4.backward(dConv);
 
-                    dConv = block3.backward(dConv, lr/currentBatchSize);
-                    dConv = expand3.backward(dConv, lr/currentBatchSize);
-                    dConv = downsample3.backward(dConv);
+                dConv = block3.backward(dConv, lr/currentBatchSize);
+                dConv = expand3.backward(dConv, lr/currentBatchSize);
+                dConv = downsample3.backward(dConv);
 
-                    dConv = block2.backward(dConv, lr/currentBatchSize);
-                    dConv = expand2.backward(dConv, lr/currentBatchSize);
-                    dConv = downsample2.backward(dConv);
+                dConv = block2.backward(dConv, lr/currentBatchSize);
+                dConv = expand2.backward(dConv, lr/currentBatchSize);
+                dConv = downsample2.backward(dConv);
 
-                    dConv = block1.backward(dConv, lr/currentBatchSize);
-                    dConv = stem_ln.backward(dConv, lr/currentBatchSize);
-                    dConv = stem_conv.backward(dConv, lr/currentBatchSize);
-                }
+                dConv = block1.backward(dConv, lr/currentBatchSize);
+                dConv = stem_ln.backward(dConv, lr/currentBatchSize);
+                dConv = stem_conv.backward(dConv, lr/currentBatchSize);
             }
         }
 
@@ -1194,11 +1145,6 @@ int main(int argc,char **argv){
         }
         avgAcc /= X.size();
         cout << "Epoch " << e+1 << "/" << epochs << ": Loss = " << avgLoss << ", Accuracy = " << avgAcc << endl;
-
-        if(freeze_base)
-            cout << " [Incremental training: base frozen]" << endl;
-        else
-            cout << " [Full training: base trainable]" << endl;
     }
 
     // --- Save Model ---
