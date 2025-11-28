@@ -87,6 +87,10 @@ sets threads, default is 4
 --size
 ```
 usual is 128x128, can be increades or decreased
+```
+--load-model
+```
+used if you have a already trained model, and using that model to train it with a newer dataset
 
 for the runner is just
 ```
