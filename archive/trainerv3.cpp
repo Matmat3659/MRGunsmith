@@ -1086,7 +1086,7 @@ int main(int argc,char **argv){
             }
         }
     
-        freeze_base = false;
+        freeze_base = true;
     }
     
     int oldFCsize = classifier.outSize;
@@ -1095,42 +1095,11 @@ int main(int argc,char **argv){
         classifier.expandOutputs(newFCsize);
     }
     
-    //2nd dry run
-    {
-        auto s = stem_conv.forward(X[0]);
-        s = stem_ln.forward(s);
-        s = block1.forward(s);
-        s = downsample2.forward(s);
-        s = expand2.forward(s);
-        s = block2.forward(s);
-        s = downsample3.forward(s);
-        s = expand3.forward(s);
-        s = block3.forward(s);
-        s = downsample4.forward(s);
-        s = expand4.forward(s);
-        s = block4.forward(s);
-
-        feature_H = s[0].size();
-        feature_W = s[0][0].size();
-        fcInputSize = s.size() * feature_H * feature_W;
-    }
-    
     cout << "Network initialized. Output feature map: " << C4 << "x" << feature_H << "x" << feature_W << "\n";
     cout << "Input size to FC: " << fcInputSize << " (C=" << C4 << ")\n";
-    
-    float bb_mult = 0.1f;
-    
-    // ---- Cosine LR setup ----
-    float lr_min = lr * 0.01f;
-    float lr_bb_min = lr_min * bb_mult;
 
     // ---------------- Training loop ----------------
     for(int e=0; e<epochs; e++){
-        float t = float(e) / float(epochs);
-        float cosine = 0.5f * (1.0f + cos(M_PI * t));
-        
-        float lr_epoch    = lr_min    + (lr    - lr_min)    * cosine;
-        float lr_bb_epoch = lr_bb_min + (lr*bb_mult - lr_bb_min) * cosine;
         float totalLoss = 0;
 
         // Shuffle indices
@@ -1181,25 +1150,25 @@ int main(int argc,char **argv){
 
             // Backward pass
             for(int b=0;b<currentBatchSize;b++){
-                auto dFlat = classifier.backward(all_dInput_fc[b], lr_epoch / currentBatchSize);
+                auto dFlat = classifier.backward(all_dInput_fc[b], lr/currentBatchSize);
                 auto dConv = unflatten(dFlat, C4, feature_H, feature_W);
 
                 if(!freeze_base) {
-                    dConv = block4.backward(dConv, lr_bb_epoch/currentBatchSize);
-                    dConv = expand4.backward(dConv, lr_bb_epoch/currentBatchSize);
+                    dConv = block4.backward(dConv, lr/currentBatchSize);
+                    dConv = expand4.backward(dConv, lr/currentBatchSize);
                     dConv = downsample4.backward(dConv);
 
-                    dConv = block3.backward(dConv, lr_bb_epoch/currentBatchSize);
-                    dConv = expand3.backward(dConv, lr_bb_epoch/currentBatchSize);
+                    dConv = block3.backward(dConv, lr/currentBatchSize);
+                    dConv = expand3.backward(dConv, lr/currentBatchSize);
                     dConv = downsample3.backward(dConv);
 
-                    dConv = block2.backward(dConv, lr_bb_epoch/currentBatchSize);
-                    dConv = expand2.backward(dConv, lr_bb_epoch/currentBatchSize);
+                    dConv = block2.backward(dConv, lr/currentBatchSize);
+                    dConv = expand2.backward(dConv, lr/currentBatchSize);
                     dConv = downsample2.backward(dConv);
 
-                    dConv = block1.backward(dConv, lr_bb_epoch/currentBatchSize);
-                    dConv = stem_ln.backward(dConv, lr_bb_epoch/currentBatchSize);
-                    dConv = stem_conv.backward(dConv, lr_bb_epoch/currentBatchSize);
+                    dConv = block1.backward(dConv, lr/currentBatchSize);
+                    dConv = stem_ln.backward(dConv, lr/currentBatchSize);
+                    dConv = stem_conv.backward(dConv, lr/currentBatchSize);
                 }
             }
         }
