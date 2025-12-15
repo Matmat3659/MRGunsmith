@@ -1,23 +1,17 @@
-#include <iostream>
+#include "crow_all.h"
+#include <fstream>
+#include <sstream>
+#include <map>
 #include <vector>
 #include <string>
-#include <fstream>
-#include <map>
-#include <cmath>
-#include <cstdlib>
-#include <ctime>
-#include <algorithm>
-#include <random>
-#include <stdexcept>
-#include <numeric>
-#include <tuple>
-#include <Eigen/Dense>
-#include <unsupported/Eigen/CXX11/Tensor>
-
-// Assuming these two headers are available in the build environment
+#include <iostream>
+#include <mutex>
+#include "json.hpp"
+#include <omp.h>
+#include "Eigen/Dense"
+#include "unsupported/Eigen/CXX11/Tensor"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#include "json.hpp" // json.hpp is still used for the dataset's tags file
 
 using json = nlohmann::json;
 using namespace std;
@@ -37,7 +31,7 @@ using Matrixf = Eigen::MatrixXf;
 constexpr float BETA1 = 0.9f;
 constexpr float BETA2 = 0.999f;
 constexpr float EPSILON = 1e-8f;
-constexpr float WEIGHT_DECAY = 0.05f; 
+constexpr float WEIGHT_DECAY = 0.05f;
 
 // --- Enum and Utility from Trainer (Essential for Model Structure) ---
 enum class Activation { GELU, RELU, SIGMOID, IDENTITY };
@@ -71,12 +65,12 @@ struct LayerNorm {
     int channels;
     Vectorf gamma; // Learnable scale
     Vectorf beta;  // Learnable shift
-    
+
     // Adam moments removed
 
     LayerNorm(int C) : channels(C) {
-        gamma.resize(C); 
-        beta.resize(C); 
+        gamma.resize(C);
+        beta.resize(C);
     }
 
     Tensor3f forward(const Tensor3f& input) {
@@ -90,14 +84,14 @@ struct LayerNorm {
         for (int c = 0; c < channels; ++c) {
             Eigen::Map<const Matrixf> mat(input.data() + c * N, H, W);
             float mean = mat.mean();
-            
+
             Matrixf diff = mat.array() - mean;
             float variance = diff.array().pow(2).mean();
 
             float invStdDev = 1.0f / std::sqrt(variance + epsilon);
 
             Matrixf normalized = diff.array() * invStdDev;
-            
+
             Eigen::Map<Matrixf> out_mat(output.data() + c * N, H, W);
             out_mat = (normalized.array() * gamma[c] + beta[c]).matrix();
         }
@@ -130,7 +124,7 @@ struct ConvLayer {
 
     Tensor4f kernels;
     Vectorf biases;
-    
+
     // Adam moments removed
 
     ConvLayer(int inChannels_, int kernelSize_, int numFilters_, Activation act_ = Activation::RELU,
@@ -144,17 +138,17 @@ struct ConvLayer {
         int channels_per_group = inChannels / groups;
 
         kernels.resize(numFilters, channels_per_group, kernelSize, kernelSize);
-        biases.resize(numFilters); 
+        biases.resize(numFilters);
     }
 
-    Tensor3f forward(const Tensor3f& input) {        
+    Tensor3f forward(const Tensor3f& input) {
         Eigen::DSizes<Eigen::Index, 3> input_dims = input.dimensions();
         int H_in = input_dims[1];
         int W_in = input_dims[2];
-        
+
         int H_out = (H_in + 2 * padding - kernelSize) / stride + 1;
         int W_out = (W_in + 2 * padding - kernelSize) / stride + 1;
-        
+
         if (H_out <= 0 || W_out <= 0) {
             throw std::runtime_error("Convolution resulted in invalid output dimensions.");
         }
@@ -169,14 +163,14 @@ struct ConvLayer {
         #pragma omp parallel for collapse(3)
         for (int f = 0; f < numFilters; ++f) {
             int group_idx = f / filters_per_group;
-            
+
             for (int i = 0; i < H_out; ++i) {
                 for (int j = 0; j < W_out; ++j) {
                     float sum = 0.0f;
-                    
+
                     for (int c_in_g = 0; c_in_g < channels_per_group; ++c_in_g) {
                         int c_in = group_idx * channels_per_group + c_in_g;
-                        
+
                         for (int ki = 0; ki < kernelSize; ++ki) {
                             for (int kj = 0; kj < kernelSize; ++kj) {
                                 int in_i = i * stride + ki - padding;
@@ -192,7 +186,7 @@ struct ConvLayer {
                 }
             }
         }
-        
+
         int N = H_out * W_out;
 
         // Apply Bias and Activation
@@ -211,7 +205,7 @@ struct ConvLayer {
                 }
             }
         }
-        
+
         return out;
     }
 
@@ -302,7 +296,7 @@ struct FCLayer {
     int inSize, outSize;
     Matrixf W;
     Vectorf B;
-    
+
     // Adam moments and dropout removed
     Activation act;
 
@@ -340,7 +334,7 @@ struct FCLayer {
         read_bin(ifs, &loaded_W_rows, 1);
         read_bin(ifs, &loaded_W_cols, 1);
         read_bin(ifs, &loaded_B_size, 1);
-        
+
         if (loaded_W_rows != W.rows() || loaded_W_cols != W.cols() || loaded_B_size != B.size()) {
             throw std::runtime_error("Weight size mismatch in FC layer " + prefix);
         }
@@ -411,7 +405,7 @@ Tensor3f load_image_stb(const string& image_path, int target_H, int target_W) {
     cout << "Loaded image: " << image_path << " (" << W_in << "x" << H_in << "x" << C << ").\n";
 
     Tensor3f input_tensor(C, target_H, target_W);
-    
+
     // Normalization parameters (standard ImageNet means/stds for ConvNeXt)
     const float means[] = {0.485f, 0.456f, 0.406f};
     const float stds[] = {0.229f, 0.224f, 0.225f};
@@ -430,14 +424,14 @@ Tensor3f load_image_stb(const string& image_path, int target_H, int target_W) {
                 // This is a manual resize implementation.
                 int h_in = (int)((float)h_out * H_in / target_H);
                 int w_in = (int)((float)w_out * W_in / target_W);
-                
+
                 // Ensure indices are within bounds (shouldn't be necessary but good practice)
                 h_in = std::min(h_in, H_in - 1);
                 w_in = std::min(w_in, W_in - 1);
 
                 // img_data is HWC, index is (h_in * W_in + w_in) * C + c
                 float val = img_data[(h_in * W_in + w_in) * C + c];
-                
+
                 // Apply normalization: (value - mean) / std
                 input_tensor(c, h_out, w_out) = (val - means[c]) / stds[c];
             }
@@ -478,152 +472,172 @@ map<int, string> load_tags(const string& model_dir, const string& model_name){
         }
         idx2tag[item.value().get<int>()] = item.key();
     }
-    
+
     if(idx2tag.empty()){
         throw std::runtime_error("Tag file loaded but contains no valid entries.");
     }
-    
+
     cout << "Loaded " << idx2tag.size() << " tags.\n";
     return idx2tag;
 }
 
-// ---------------- Main Inference Function ----------------
+std::mutex g_model_mutex;
 
-int main(int argc, char **argv){
-    // --- Inference Configuration ---
-    string imagePath = "";
-    string modelDir = "."; // Current directory by default
-    string modelName = "model_best"; // Use the best checkpoint by default
-    int imageSize = 224; // Default input size for ConvNeXt
-    int numThreads = 1; // Inference often runs faster with fewer threads
+// ---------------- Model Config ----------------
+struct ModelConfig {
+    std::string folder;
+    std::string nickname;
+    std::string checkpoint_prefix; // model_best, model_final, etc
+};
 
-    for(int i=1;i<argc;i++){
-        string arg=argv[i];
-        if(arg=="--image" && i+1<argc){ imagePath = argv[i+1]; i++; }
-        else if(arg=="--model-dir" && i+1<argc){ modelDir = argv[i+1]; i++; }
-        else if(arg=="--model-name" && i+1<argc){ modelName = argv[i+1]; i++; }
-        else if(arg=="--size" && i+1<argc){ imageSize = stoi(argv[i+1]); i++; }
-        else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
+std::map<std::string, ModelConfig> g_models;
+
+// ---------------- Config Loader ----------------
+void load_config(const std::string& path){
+    std::ifstream f(path);
+    if(!f.is_open()) throw std::runtime_error("Cannot open config: " + path);
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty() || line[0]=='#') continue;
+        std::istringstream iss(line);
+        std::string folder, nickname, prefix;
+        if(!(iss >> folder >> nickname >> prefix)) continue;
+        g_models[nickname] = {folder, nickname, prefix};
     }
-    
-    if (imagePath.empty()) {
-        cerr << "Error: --image argument is required.\n";
-        return 1;
-    }
-    
-    try {
-        omp_set_num_threads(numThreads);
-        Eigen::setNbThreads(numThreads);
-        cout << "Using " << numThreads << " OpenMP threads for inference.\n";
-        
-        // --- Load Tags ---
-        map<int, string> idx2tag = load_tags(modelDir, modelName);
-        int num_labels = idx2tag.size();
-        
-        // --- Pre-process Image ---
-        int C_in = 3; // RGB
-        Tensor3f input_tensor = load_image_stb(imagePath, imageSize, imageSize);
+    std::cout << "Loaded " << g_models.size() << " models from config.\n";
+}
 
-        // --- ConvNeXt Tiny-like Architecture Channels ---
-        const int C1 = 64;
-        const int C2 = 128;
-        const int C3 = 256;
-        const int C4 = 512;
+// ---------------- Inference Wrapper ----------------
+json run_inference(const std::string& model_nick, const std::vector<std::string>& images, float threshold=0.5f, int threads=1){
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    if(g_models.find(model_nick) == g_models.end())
+        throw std::runtime_error("Model not found: " + model_nick);
 
-        // --- Model Definition and Loading ---
-        
-        // 1. Stem: 4x4, stride 4
+    const auto& cfg = g_models[model_nick];
+    const std::string modelDir = cfg.folder;
+    const std::string prefix = modelDir + "/" + cfg.checkpoint_prefix; // FIXED
+
+    omp_set_num_threads(threads);
+    Eigen::setNbThreads(threads);
+
+    // Load tags
+    auto idx2tag = load_tags(modelDir, cfg.checkpoint_prefix);
+    int num_labels = idx2tag.size();
+
+    json results = json::array();
+
+    for(auto& imagePath : images){
+        Tensor3f input_tensor = load_image_stb(imagePath, 224, 224); // resize to 224x224
+
+        // ---------------- Model Definition ----------------
+        const int C_in = 3;
+        const int C1 = 64, C2 = 128, C3 = 256, C4 = 512;
+
         ConvLayer stem_conv(C_in, 4, C1, Activation::IDENTITY, 4, 0, 1);
         LayerNorm stem_ln(C1);
-        
-        // 2. Stage 1 (Resolution / 4)
+
         ConvNeXtBlock block1(C1);
+        MaxPool downsample2(2,2);
+        ConvLayer expand2(C1,1,C2); ConvNeXtBlock block2(C2);
 
-        // 3. Stage 2 Downsampling (Resolution / 8)
-        MaxPool downsample2(2, 2);
-        ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1);
-        ConvNeXtBlock block2(C2);
+        MaxPool downsample3(2,2);
+        ConvLayer expand3(C2,1,C3); ConvNeXtBlock block3(C3);
 
-        // 4. Stage 3 Downsampling (Resolution / 16)
-        MaxPool downsample3(2, 2);
-        ConvLayer expand3(C2, 1, C3, Activation::IDENTITY, 1, 0, 1);
-        ConvNeXtBlock block3(C3);
+        MaxPool downsample4(2,2);
+        ConvLayer expand4(C3,1,C4); ConvNeXtBlock block4(C4);
 
-        // 5. Stage 4 Downsampling (Resolution / 32)
-        MaxPool downsample4(2, 2);
-        ConvLayer expand4(C3, 1, C4, Activation::IDENTITY, 1, 0, 1);
-        ConvNeXtBlock block4(C4);
-
-        // 6. Head
         GlobalAvgPool gap;
-        int fcInputSize = C4;
-        FCLayer classifier(fcInputSize, num_labels, Activation::SIGMOID); 
+        FCLayer classifier(C4, num_labels, Activation::SIGMOID);
 
-        // Load Weights
-        cout << "Loading model weights from " << modelDir << "/" << modelName << "_*.bin...\n";
-        string prefix = modelDir + "/" + modelName;
-
+        // Load weights
         stem_conv.load(prefix + "_stem_conv");
         stem_ln.load(prefix + "_stem_ln");
-        block1.load(prefix + "_block1");
-        expand2.load(prefix + "_expand2");
-        block2.load(prefix + "_block2");
-        expand3.load(prefix + "_expand3");
-        block3.load(prefix + "_block3");
-        expand4.load(prefix + "_expand4");
-        block4.load(prefix + "_block4");
+        block1.load(prefix + "_block1"); 
+        expand2.load(prefix + "_expand2"); block2.load(prefix + "_block2");
+        expand3.load(prefix + "_expand3"); block3.load(prefix + "_block3");
+        expand4.load(prefix + "_expand4"); block4.load(prefix + "_block4");
         classifier.load(prefix + "_classifier");
-        cout << "Model loaded successfully.\n";
 
-        // --- Forward Pass ---
-        
-        cout << "Running forward pass...\n";
+        // ---------------- Forward Pass ----------------
         auto s = stem_conv.forward(input_tensor);
         s = stem_ln.forward(s);
-        s = block1.forward(s);
-        s = downsample2.forward(s);
-        s = expand2.forward(s);
-        s = block2.forward(s);
-        s = downsample3.forward(s);
-        s = expand3.forward(s);
-        s = block3.forward(s);
-        s = downsample4.forward(s);
-        s = expand4.forward(s);
-        s = block4.forward(s);
-        
+        s = block1.forward(s); s = downsample2.forward(s); s = expand2.forward(s); s = block2.forward(s);
+        s = downsample3.forward(s); s = expand3.forward(s); s = block3.forward(s);
+        s = downsample4.forward(s); s = expand4.forward(s); s = block4.forward(s);
+
         Vectorf pooled = gap.forward(s);
         Vectorf pred = classifier.forward(pooled);
-        
-        // --- Process and Print Results ---
-        
-        cout << "\n--- Prediction Results ---\n";
-        
-        // Create a list of {score, tag_name} pairs
-        vector<pair<float, string>> results;
-        for(int i=0; i<pred.size(); i++){
-            // Check if the tag index exists (should always if loading was successful)
-            if(idx2tag.count(i)){
-                results.push_back({pred(i), idx2tag.at(i)});
+
+        // ---------------- Threshold & Collect Tags ----------------
+        std::vector<std::string> tag_list;
+        for(int i=0;i<pred.size();i++){
+            if(idx2tag.count(i) && pred(i)>=threshold){
+                tag_list.push_back(idx2tag[i]);
             }
         }
-        
-        // Sort by score in descending order
-        sort(results.begin(), results.end(), [](const auto& a, const auto& b){
-            return a.first > b.first;
+
+        results.push_back({
+            {"Model", model_nick},
+            {"Image", imagePath},
+            {"Tags", tag_list}
         });
-
-        // Print top results
-        int top_k = std::min((int)results.size(), 10);
-        cout << "Top " << top_k << " Predictions:\n";
-        for(int i=0; i<top_k; i++){
-            cout << std::fixed << std::setprecision(4) 
-                 << results[i].first << " : " << results[i].second << "\n";
-        }
-
-    } catch (const std::exception& e) {
-        cerr << "Inference Error: " << e.what() << endl;
-        return 1;
     }
-    
+
+    return results;
+}
+
+// ---------------- Main API Server ----------------
+int main(int argc, char* argv[]){
+    std::string config_file, address="127.0.0.1";
+    uint16_t port=18080;
+    int threads=1;
+
+    for(int i=1;i<argc;i++){
+        std::string arg = argv[i];
+        if(arg=="--config" && i+1<argc) { config_file = argv[i+1]; i++; }
+        else if(arg=="--port" && i+1<argc) { port = std::stoi(argv[i+1]); i++; }
+        else if(arg=="--address" && i+1<argc) { address = argv[i+1]; i++; }
+        else if(arg=="--threads" && i+1<argc) { threads = std::stoi(argv[i+1]); i++; }
+    }
+
+    if(config_file.empty()){
+        std::cerr << "Error: --config <file> required\n"; return 1;
+    }
+
+    try { load_config(config_file); }
+    catch(const std::exception& e){ std::cerr << "Config Error: " << e.what() << "\n"; return 1; }
+
+    crow::App<crow::CORSHandler> app;
+    app.get_middleware<crow::CORSHandler>().global(); // fixed for Crow
+
+    // ---------------- /infer endpoint ----------------
+    CROW_ROUTE(app,"/infer").methods("POST"_method)
+    ([&](const crow::request& req){
+        json req_json;
+        try { req_json = json::parse(req.body); } 
+        catch(...) { return crow::response(400, "Invalid JSON"); }
+
+        if(!req_json.contains("Model") || !req_json.contains("Image"))
+            return crow::response(400, "Missing Model or Image field");
+
+        std::string model_nick = req_json["Model"];
+        float threshold = req_json.value("threshold", 0.5f);
+        std::vector<std::string> images;
+
+        if(req_json["Image"].is_string()) images.push_back(req_json["Image"].get<std::string>());
+        else if(req_json["Image"].is_array()){
+            for(auto& v : req_json["Image"]) images.push_back(v.get<std::string>());
+        } else return crow::response(400,"Invalid Image field");
+
+        try {
+            json res = run_inference(model_nick, images, threshold, threads);
+            return crow::response(res.dump());
+        } catch(const std::exception& e){
+            return crow::response(500, std::string("Inference Error: ") + e.what());
+        }
+    });
+
+    std::cout << "Server running at http://" << address << ":" << port << "\n";
+    app.bindaddr(address).port(port).multithreaded().run();
     return 0;
 }

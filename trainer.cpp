@@ -9,266 +9,297 @@
 #include <algorithm>
 #include <random>
 #include <stdexcept>
+#include <numeric>
 #include <omp.h>
-#include <tuple> // For std::tie in BCE
+#include <tuple>
+#include <Eigen/Dense>
+#include <unsupported/Eigen/CXX11/Tensor>
 
+// Assuming these two headers are available in the build environment
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#include "json.hpp"
+#include "json.hpp" // json.hpp is still used for the dataset's tags file
 
 using json = nlohmann::json;
 using namespace std;
 
-// Define M_PI if not available
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// ---------------- Activation ----------------
+// --- Type Definitions for Eigen ---
+using Tensor3f = Eigen::Tensor<float, 3, Eigen::RowMajor>; // Channel, Height, Width
+using Tensor4f = Eigen::Tensor<float, 4, Eigen::RowMajor>; // Out, In, K, K
+using Vectorf = Eigen::VectorXf;
+using Matrixf = Eigen::MatrixXf;
 
-// ReLU (Rectified Linear Unit)
-inline float relu(float x) { return std::max(0.0f, x); }
-inline float relu_deriv(float x) { return x > 0.0f ? 1.0f : 0.0f; }
+// --- Global Optimization Parameters ---
+constexpr float BETA1 = 0.9f;
+constexpr float BETA2 = 0.999f;
+constexpr float EPSILON = 1e-8f;
+constexpr float WEIGHT_DECAY = 0.05f; // L2 regularization (ConvNeXt standard)
 
-// Softplus (smooth approximation of ReLU, used here as a proxy for GELU)
-inline float softplus(float x) { return std::log1p(std::exp(x)); }
-inline float softplus_deriv(float x) {
-    // derivative of softplus is sigmoid
-    if (x >= 0.0f) {
-        float z = std::exp(-x);
-        return 1.0f / (1.0f + z);
-    } else {
-        float z = std::exp(x);
-        return z / (1.0f + z);
+// ---------------- Binary I/O Utilities ----------------
+
+template<typename T>
+void write_bin(ofstream& ofs, const T* data, size_t size) {
+    if (size > 0) {
+        ofs.write(reinterpret_cast<const char*>(data), size * sizeof(T));
     }
 }
 
-// Sigmoid (logistic) - used mainly for BCE output and Softplus derivative
+template<typename T>
+void read_bin(ifstream& ifs, T* data, size_t size) {
+    if (size > 0) {
+        ifs.read(reinterpret_cast<char*>(data), size * sizeof(T));
+    }
+}
+
+// ---------------- Activation Functions ----------------
+
+// Sigmoid and its derivative
 inline float sigmoid(float x) {
-    // Handle overflow prevention
     if (x < -20.0f) return 1e-7f;
     if (x > 20.0f) return 1.0f - 1e-7f;
     return 1.0f / (1.0f + std::exp(-x));
 }
-inline float sigmoid_deriv(float x) {
-    float s = sigmoid(x);
-    return s * (1.0f - s);
+
+// Gaussian Error Linear Unit (GELU) Approximation (Standard for ConvNeXt)
+inline float gelu(float x) {
+    return 0.5f * x * (1.0f + std::tanh(std::sqrt(2.0f / M_PI) * (x + 0.044715f * x * x * x)));
 }
 
-// ====================== ACT ENUM =====================
-enum class Activation { RELU, SOFTPLUS, SIGMOID, IDENTITY };
+inline float gelu_deriv(float x) {
+    // Simplified derivative for the approximation (fast and effective)
+    float tanh_arg = std::sqrt(2.0f / M_PI) * (x + 0.044715f * x * x * x);
+    float sech2 = 1.0f - std::tanh(tanh_arg) * std::tanh(tanh_arg);
+    float deriv_tanh_arg = std::sqrt(2.0f / M_PI) * (1.0f + 3.0f * 0.044715f * x * x);
+    
+    return 0.5f * (1.0f + std::tanh(tanh_arg)) + 0.5f * x * sech2 * deriv_tanh_arg;
+}
 
-// ---------------- Xavier Initialization ----------------
+// ReLU
+inline float relu(float x) { return std::max(0.0f, x); }
+inline float relu_deriv(float x) { return x > 0.0f ? 1.0f : 0.0f; }
+
+enum class Activation { GELU, RELU, SIGMOID, IDENTITY };
+
+// ---------------- Initialization and Schedule ----------------
+
 float xavier_init(int fan_in, int fan_out) {
-    // Simple He/Kaiming initialization approximation
     thread_local std::mt19937 gen(std::random_device{}());
-    // For ReLU-like activations (SOFTPLUS is close enough)
     float limit = std::sqrt(2.0f / fan_in);
     std::uniform_real_distribution<float> dist(-limit, limit);
     return dist(gen);
 }
 
-// ---------------- Flatten / Unflatten ----------------
-vector<float> flatten(const vector<vector<vector<float>>>& x){
-    vector<float> out;
-    for(const auto &f:x)
-        for(const auto &row:f)
-            for(float v:row)
-                out.push_back(v);
-    return out;
+// Cosine Annealing LR Schedule with Warmup
+float cosine_annealing_lr(float base_lr, int current_epoch, int total_epochs, float warmup_epochs) {
+    if (current_epoch < warmup_epochs) {
+        // Linear Warmup
+        return base_lr * (static_cast<float>(current_epoch) / warmup_epochs);
+    }
+    // Cosine Annealing
+    float t = static_cast<float>(current_epoch - warmup_epochs);
+    float T = static_cast<float>(total_epochs - warmup_epochs);
+    if (T <= 0) return base_lr;
+    return base_lr * 0.5f * (1.0f + std::cos(M_PI * t / T));
 }
 
-vector<vector<vector<float>>> unflatten(const vector<float>& flat, int F, int H, int W){
-    if(flat.size() != size_t(F*H*W)){
-        throw std::runtime_error("unflatten: flat vector size does not match target shape");
+// ---------------- Global Average Pooling ----------------
+struct GlobalAvgPool {
+    GlobalAvgPool() {}
+
+    Vectorf forward(const Tensor3f& input) {
+        int C = input.dimension(0);
+        int H = input.dimension(1);
+        int W = input.dimension(2);
+        int N = H * W;
+        Vectorf out(C);
+
+        #pragma omp parallel for
+        for (int c = 0; c < C; ++c) {
+            Eigen::Map<const Matrixf> mat(input.data() + c * N, H, W);
+            out[c] = mat.mean();
+        }
+        return out;
     }
 
-    vector<vector<vector<float>>> out(F, vector<vector<float>>(H, vector<float>(W)));
-    int k = 0;
-    for(int f=0; f<F; f++)
-        for(int i=0; i<H; i++)
-            for(int j=0; j<W; j++)
-                out[f][i][j] = flat[k++];
-    return out;
-}
+    Tensor3f backward(const Vectorf& dOut, int H, int W) {
+        int C = dOut.size();
+        Tensor3f dInput(C, H, W);
+        float invN = 1.0f / (H * W);
+
+        #pragma omp parallel for collapse(3)
+        for (int c = 0; c < C; ++c) {
+            float grad_c = dOut[c] * invN;
+            for (int h = 0; h < H; ++h) {
+                for (int w = 0; w < W; ++w) {
+                    dInput(c, h, w) = grad_c;
+                }
+            }
+        }
+        return dInput;
+    }
+    // No parameters to save/load
+};
 
 // ---------------- Layer Normalization ----------------
 struct LayerNorm {
     int channels;
-    std::vector<float> gamma; // Learnable scale
-    std::vector<float> beta;  // Learnable shift
+    Vectorf gamma; // Learnable scale
+    Vectorf beta;  // Learnable shift
+    
+    // Adam moments
+    Vectorf M_gamma, V_gamma;
+    Vectorf M_beta, V_beta;
 
-    // Cached values for backward pass
-    std::vector<float> lastInputFlat; // [C * H * W]
-    std::vector<float> lastMean;      // [C]
-    std::vector<float> lastInvStdDev; // [C]
+    // Backward pass state
+    Tensor3f lastInput;
+    Vectorf lastMean;
+    Vectorf lastInvStdDev;
 
     LayerNorm(int C) : channels(C) {
-        gamma.resize(C, 1.0f); // Initialize scale to 1
-        beta.resize(C, 0.0f);  // Initialize shift to 0
+        gamma.resize(C); gamma.setOnes();
+        beta.resize(C); beta.setZero();
+        M_gamma.resize(C); M_gamma.setZero();
+        V_gamma.resize(C); V_gamma.setZero();
+        M_beta.resize(C); M_beta.setZero();
+        V_beta.resize(C); V_beta.setZero();
     }
 
-    // Input shape: [C][H][W]
-    // LayerNorm normalizes across the spatial dimensions (H, W) for each channel (C) independently.
-    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input) {
-        int H = input[0].size();
-        int W = input[0][0].size();
-        int N = H * W; // Elements per channel
+    Tensor3f forward(const Tensor3f& input) {
+        int H = input.dimension(1);
+        int W = input.dimension(2);
+        int N = H * W; // H*W elements per channel
 
-        // Flatten the input and resize caches
-        lastInputFlat.assign(channels * N, 0.0f);
-        lastMean.assign(channels, 0.0f);
-        lastInvStdDev.assign(channels, 0.0f);
+        lastInput = input;
+        lastMean.resize(channels);
+        lastInvStdDev.resize(channels);
 
-        std::vector<std::vector<std::vector<float>>> output(channels, std::vector<std::vector<float>>(H, std::vector<float>(W)));
+        Tensor3f output(channels, H, W);
         const float epsilon = 1e-5f;
 
         #pragma omp parallel for
         for (int c = 0; c < channels; ++c) {
-            float mean = 0.0f;
-            // Calculate Mean
-            for (int i = 0; i < H; ++i) {
-                for (int j = 0; j < W; ++j) {
-                    float val = input[c][i][j];
-                    mean += val;
-                    lastInputFlat[c * N + i * W + j] = val;
-                }
-            }
-            mean /= N;
-            lastMean[c] = mean;
-
-            // Calculate Variance
-            float variance = 0.0f;
-            for (int i = 0; i < H; ++i) {
-                for (int j = 0; j < W; ++j) {
-                    float diff = input[c][i][j] - mean;
-                    variance += diff * diff;
-                }
-            }
-            variance /= N;
+            Eigen::Map<const Matrixf> mat(input.data() + c * N, H, W);
+            float mean = mat.mean();
+            
+            Matrixf diff = mat.array() - mean;
+            float variance = diff.array().pow(2).mean();
 
             float invStdDev = 1.0f / std::sqrt(variance + epsilon);
+
+            lastMean[c] = mean;
             lastInvStdDev[c] = invStdDev;
 
-            // Normalize and apply scale/shift
-            for (int i = 0; i < H; ++i) {
-                for (int j = 0; j < W; ++j) {
-                    float normalized = (input[c][i][j] - mean) * invStdDev;
-                    output[c][i][j] = gamma[c] * normalized + beta[c];
-                }
-            }
+            Matrixf normalized = diff.array() * invStdDev;
+            
+            Eigen::Map<Matrixf> out_mat(output.data() + c * N, H, W);
+            out_mat = (normalized.array() * gamma[c] + beta[c]).matrix();
         }
         return output;
     }
 
-    // dOut shape: [C][H][W]
-    // Returns dInput [C][H][W]
-    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, float lr) {
-        int H = dOut[0].size();
-        int W = dOut[0][0].size();
+    Tensor3f backward(const Tensor3f& dOut, float lr, int t) {
+        int H = dOut.dimension(1);
+        int W = dOut.dimension(2);
         int N = H * W;
-        const float epsilon = 1e-5f;
+        const float invN = 1.0f / N;
 
-        std::vector<std::vector<std::vector<float>>> dInput(channels, std::vector<std::vector<float>>(H, std::vector<float>(W)));
+        Tensor3f dInput(channels, H, W);
+
+        // Adam learning rate with bias correction
+        float lr_t = lr * std::sqrt(1.0f - std::pow(BETA2, t)) / (1.0f - std::pow(BETA1, t));
 
         #pragma omp parallel for
         for (int c = 0; c < channels; ++c) {
             float mean = lastMean[c];
             float invStdDev = lastInvStdDev[c];
 
-            // 1. Calculate dGamma and dBeta
-            float dGamma = 0.0f;
-            float dBeta = 0.0f;
+            Eigen::Map<const Matrixf> dOut_mat(dOut.data() + c * N, H, W);
+            Eigen::Map<const Matrixf> input_mat(lastInput.data() + c * N, H, W);
 
-            // dNormalized = dOut * gamma
-            std::vector<float> dNormalized(N);
+            Matrixf x_minus_mu = input_mat.array() - mean;
+            // Matrixf normalized = x_minus_mu.array() * invStdDev; // Recompute normalized or use saved? Saved state is more memory efficient.
 
-            for (int i = 0; i < H; ++i) {
-                for (int j = 0; j < W; ++j) {
-                    int flatIdx = c * N + i * W + j;
-                    float x_minus_mu = lastInputFlat[flatIdx] - mean;
-                    float normalized = x_minus_mu * invStdDev;
+            // Gradients for gamma and beta
+            Matrixf normalized_from_input = x_minus_mu.array() * invStdDev; // Recompute for accuracy
+            float dGamma = (dOut_mat.array() * normalized_from_input.array()).sum();
+            float dBeta = dOut_mat.sum();
 
-                    float grad_out = dOut[c][i][j];
-                    dGamma += grad_out * normalized;
-                    dBeta += grad_out;
+            // Adam Update for gamma (no decay)
+            M_gamma[c] = BETA1 * M_gamma[c] + (1.0f - BETA1) * dGamma;
+            V_gamma[c] = BETA2 * V_gamma[c] + (1.0f - BETA2) * dGamma * dGamma;
+            gamma[c] -= lr_t * M_gamma[c] / (std::sqrt(V_gamma[c]) + EPSILON);
 
-                    dNormalized[i * W + j] = grad_out * gamma[c];
-                }
-            }
+            // Adam Update for beta (no decay)
+            M_beta[c] = BETA1 * M_beta[c] + (1.0f - BETA1) * dBeta;
+            V_beta[c] = BETA2 * V_beta[c] + (1.0f - BETA2) * dBeta * dBeta;
+            beta[c] -= lr_t * M_beta[c] / (std::sqrt(V_beta[c]) + EPSILON);
 
-            // Update gamma and beta
-            gamma[c] -= lr * dGamma;
-            beta[c] -= lr * dBeta;
+            // Gradient for normalized input
+            Matrixf dNormalized = dOut_mat.array() * gamma[c];
 
-            // 2. Calculate dInput (dL/dX)
-            float term1_sum = 0.0f;
-            float term2_sum = 0.0f;
+            // Calculate gradient for the input (dInput)
+            float term1_sum = (dNormalized.array() * x_minus_mu.array()).sum();
+            float term2_sum = dNormalized.sum();
 
-            for (int i = 0; i < H; ++i) {
-                for (int j = 0; j < W; ++j) {
-                    int flatIdx = c * N + i * W + j;
-                    float x_minus_mu = lastInputFlat[flatIdx] - mean;
-                    float dN = dNormalized[i * W + j];
-
-                    term1_sum += dN * x_minus_mu;
-                    term2_sum += dN;
-                }
-            }
-
-            float invN = 1.0f / N;
             float invN_stddev_pow3 = invN * invStdDev * invStdDev * invStdDev;
 
-            for (int i = 0; i < H; ++i) {
-                for (int j = 0; j < W; ++j) {
-                    int flatIdx = c * N + i * W + j;
-                    float x_minus_mu = lastInputFlat[flatIdx] - mean;
-                    float dN = dNormalized[i * W + j];
-
-                    float dX_i = dN * invStdDev;
-                    dX_i -= x_minus_mu * term1_sum * invN_stddev_pow3;
-                    dX_i -= term2_sum * invStdDev * invN;
-
-                    dInput[c][i][j] = dX_i;
-                }
-            }
+            Matrixf dX_i = dNormalized.array() * invStdDev;
+            dX_i.array() -= x_minus_mu.array() * term1_sum * invN_stddev_pow3;
+            dX_i.array() -= term2_sum * invStdDev * invN;
+            
+            Eigen::Map<Matrixf> dInput_mat(dInput.data() + c * N, H, W);
+            dInput_mat = dX_i;
         }
         return dInput;
     }
 
-    void save(const std::string& prefix){
-        std::ofstream gfile(prefix + "_gamma.bin", std::ios::binary);
-        gfile.write(reinterpret_cast<char*>(gamma.data()), gamma.size()*sizeof(float));
-        gfile.close();
+    void save(const std::string& prefix) {
+        ofstream ofs(prefix + ".bin", ios::binary);
+        if (!ofs.is_open()) { cerr << "Cannot open " << prefix << ".bin for LayerNorm saving\n"; return; }
 
-        std::ofstream bfile(prefix + "_beta.bin", std::ios::binary);
-        bfile.write(reinterpret_cast<char*>(beta.data()), beta.size()*sizeof(float));
-        bfile.close();
+        int C_size = channels;
+        write_bin(ofs, &C_size, 1);
+        write_bin(ofs, gamma.data(), gamma.size());
+        write_bin(ofs, beta.data(), beta.size());
     }
+    
+    void load(const std::string& prefix) {
+        ifstream ifs(prefix + ".bin", ios::binary);
+        if (!ifs.is_open()) { cerr << "Cannot open " << prefix << ".bin for LayerNorm loading\n"; return; }
 
-    void load(const std::string& prefix){
-        std::ifstream gfile(prefix + "_gamma.bin", std::ios::binary);
-        gfile.read(reinterpret_cast<char*>(gamma.data()), gamma.size()*sizeof(float));
-        gfile.close();
+        int C_size;
+        read_bin(ifs, &C_size, 1);
+        if (C_size != channels) {
+            cerr << "Channel size mismatch in LayerNorm " << prefix << endl;
+            return;
+        }
 
-        std::ifstream bfile(prefix + "_beta.bin", std::ios::binary);
-        bfile.read(reinterpret_cast<char*>(beta.data()), beta.size()*sizeof(float));
-        bfile.close();
+        read_bin(ifs, gamma.data(), gamma.size());
+        read_bin(ifs, beta.data(), beta.size());
     }
 };
 
-// ---------------- Convolution Layer (Modified to support Depthwise) ----------------
+// ---------------- Convolution Layer ----------------
 struct ConvLayer {
     int kernelSize, numFilters, stride, padding;
     Activation act;
     int inChannels;
-    int groups; // groups=inChannels means Depthwise Conv
+    int groups;
 
-    std::vector<std::vector<std::vector<std::vector<float>>>> kernels;
-    std::vector<float> biases;
+    Tensor4f kernels;
+    Vectorf biases;
+    
+    // Adam moments
+    Tensor4f M_kernels, V_kernels;
+    Vectorf M_biases, V_biases;
 
-    std::vector<std::vector<std::vector<float>>> lastInput;
-    std::vector<std::vector<std::vector<float>>> lastPreActivation;
+    // Backward pass state
+    Tensor3f lastInput;
+    Tensor3f lastPreActivation;
 
     ConvLayer(int inChannels_, int kernelSize_, int numFilters_, Activation act_ = Activation::RELU,
               int stride_ = 1, int padding_ = 0, int groups_ = 1)
@@ -280,97 +311,128 @@ struct ConvLayer {
         }
         int channels_per_group = inChannels / groups;
 
-        // Kernels shape: [numFilters][channels_per_group][kernelSize][kernelSize]
-        kernels.resize(numFilters, std::vector<std::vector<std::vector<float>>>(
-            channels_per_group,
-            std::vector<std::vector<float>>(kernelSize, std::vector<float>(kernelSize))));
+        kernels.resize(numFilters, channels_per_group, kernelSize, kernelSize);
+        biases.resize(numFilters); biases.setZero();
+        M_kernels.resize(kernels.dimensions()); M_kernels.setZero();
+        V_kernels.resize(kernels.dimensions()); V_kernels.setZero();
+        M_biases.resize(numFilters); M_biases.setZero();
+        V_biases.resize(numFilters); V_biases.setZero();
 
-        biases.resize(numFilters, 0.0f);
+        float limit = std::sqrt(2.0f / (kernelSize*kernelSize*channels_per_group));
+        std::uniform_real_distribution<float> dist(-limit, limit);
+        std::mt19937 gen(std::random_device{}());
 
-        // Initialize weights
-        #pragma omp parallel for collapse(4)
-        for(int f=0; f<numFilters; f++)
-            for(int c=0; c<channels_per_group; c++)
-                for(int i=0; i<kernelSize; i++)
-                    for(int j=0; j<kernelSize; j++)
-                        kernels[f][c][i][j] = xavier_init(kernelSize*kernelSize*channels_per_group, numFilters/groups);
+        for(int i=0; i<kernels.size(); ++i) {
+            kernels.data()[i] = dist(gen);
+        }
     }
 
-    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input) {
+    Tensor3f forward(const Tensor3f& input) {
         lastInput = input;
-        int n = input[0].size();
-        int outSize = (n + 2*padding - kernelSize) / stride + 1;
+        
+        Eigen::DSizes<Eigen::Index, 3> input_dims = input.dimensions();
+        int H_in = input_dims[1];
+        int W_in = input_dims[2];
+        
+        int H_out = (H_in + 2 * padding - kernelSize) / stride + 1;
+        int W_out = (W_in + 2 * padding - kernelSize) / stride + 1;
+        
+        if (H_out <= 0 || W_out <= 0) {
+            throw std::runtime_error("Convolution resulted in invalid output dimensions.");
+        }
 
-        lastPreActivation.assign(numFilters, std::vector<std::vector<float>>(outSize, std::vector<float>(outSize, 0.0f)));
-        std::vector<std::vector<std::vector<float>>> out(numFilters, std::vector<std::vector<float>>(outSize, std::vector<float>(outSize, 0.0f)));
+        Tensor3f out(numFilters, H_out, W_out);
+        out.setZero();
 
         int channels_per_group = inChannels / groups;
         int filters_per_group = numFilters / groups;
 
+        // Manual Forward Pass (highly parallelized)
         #pragma omp parallel for collapse(3)
-        for(int f=0; f<numFilters; f++){
+        for (int f = 0; f < numFilters; ++f) {
             int group_idx = f / filters_per_group;
-
-            for(int i=0; i<outSize; i++){
-                for(int j=0; j<outSize; j++){
+            
+            for (int i = 0; i < H_out; ++i) {
+                for (int j = 0; j < W_out; ++j) {
                     float sum = 0.0f;
-
-                    for(int c_in_g=0; c_in_g<channels_per_group; c_in_g++){
+                    
+                    for (int c_in_g = 0; c_in_g < channels_per_group; ++c_in_g) {
                         int c_in = group_idx * channels_per_group + c_in_g;
+                        
+                        for (int ki = 0; ki < kernelSize; ++ki) {
+                            for (int kj = 0; kj < kernelSize; ++kj) {
+                                int in_i = i * stride + ki - padding;
+                                int in_j = j * stride + kj - padding;
 
-                        for(int ki=0; ki<kernelSize; ki++)
-                            for(int kj=0; kj<kernelSize; kj++){
-                                int in_i = i*stride + ki - padding;
-                                int in_j = j*stride + kj - padding;
-                                float val = (in_i>=0 && in_i<n && in_j>=0 && in_j<n) ? input[c_in][in_i][in_j] : 0.0f;
-                                sum += val * kernels[f][c_in_g][ki][kj];
+                                if (in_i >= 0 && in_i < H_in && in_j >= 0 && in_j < W_in) {
+                                    sum += input(c_in, in_i, in_j) * kernels(f, c_in_g, ki, kj);
+                                }
                             }
+                        }
                     }
-
-                    sum += biases[f];
-                    lastPreActivation[f][i][j] = sum;
-
-                    // Activation
-                    switch(act){
-                        case Activation::RELU: out[f][i][j] = relu(sum); break;
-                        case Activation::SOFTPLUS: out[f][i][j] = softplus(sum); break;
-                        case Activation::SIGMOID: out[f][i][j] = sigmoid(sum); break;
-                        case Activation::IDENTITY: out[f][i][j] = sum; break;
-                    }
+                    out(f, i, j) = sum;
                 }
             }
         }
+        
+        int N = H_out * W_out;
 
+        lastPreActivation = out;
+
+        // Apply Bias and Activation
+        #pragma omp parallel for
+        for (int f = 0; f < numFilters; ++f) {
+            Eigen::Map<Matrixf> mat(out.data() + f * N, H_out, W_out);
+            mat.array() += biases[f];
+
+            for (int i = 0; i < N; ++i) {
+                float& val = out.data()[f * N + i];
+                lastPreActivation.data()[f * N + i] = val; // Save value before activation
+                switch(act){
+                    case Activation::RELU: val = relu(val); break;
+                    case Activation::GELU: val = gelu(val); break;
+                    case Activation::SIGMOID: val = sigmoid(val); break;
+                    case Activation::IDENTITY: break;
+                }
+            }
+        }
+        
         return out;
     }
 
-    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, float lr){
-        int n = lastInput[0].size();
-        int outSize = dOut[0].size();
-        std::vector<std::vector<std::vector<float>>> dInput(inChannels, std::vector<std::vector<float>>(n, std::vector<float>(n,0.0f)));
+    Tensor3f backward(const Tensor3f& dOut, float lr, int t){
+        int n = lastInput.dimension(1); // Assuming square input H=W=n
+        int outH = dOut.dimension(1);
+        int outW = dOut.dimension(2);
+        
+        Tensor3f dInput(inChannels, n, n); dInput.setZero();
 
         int channels_per_group = inChannels / groups;
         int filters_per_group = numFilters / groups;
+
+        Tensor4f dKernels(numFilters, channels_per_group, kernelSize, kernelSize); dKernels.setZero();
+        Vectorf dBiases(numFilters); dBiases.setZero();
 
         #pragma omp parallel for
         for(int f=0; f<numFilters; f++){
             int group_idx = f / filters_per_group;
 
-            for(int i=0; i<outSize; i++){
-                for(int j=0; j<outSize; j++){
-                    float grad = 0.0f;
-                    float z = lastPreActivation[f][i][j];
+            for(int i=0; i<outH; i++){
+                for(int j=0; j<outW; j++){
+                    float grad = dOut(f, i, j);
+                    float z = lastPreActivation(f, i, j);
 
-                    // Apply derivative of activation
+                    // Apply Activation Derivative
                     switch(act){
-                        case Activation::RELU: grad = dOut[f][i][j]*relu_deriv(z); break;
-                        case Activation::SOFTPLUS: grad = dOut[f][i][j]*softplus_deriv(z); break;
-                        case Activation::SIGMOID: grad = dOut[f][i][j]*sigmoid_deriv(z); break;
-                        case Activation::IDENTITY: grad = dOut[f][i][j]; break; // Derivative of f(x)=x is 1
+                        case Activation::RELU: grad *= relu_deriv(z); break;
+                        case Activation::GELU: grad *= gelu_deriv(z); break;
+                        case Activation::SIGMOID: grad *= (sigmoid(z) * (1.0f - sigmoid(z))); break;
+                        case Activation::IDENTITY: break;
                     }
 
-                    biases[f] -= lr*grad;
+                    dBiases[f] += grad;
 
+                    // Compute dInput and dKernels
                     for(int c_in_g=0; c_in_g<channels_per_group; c_in_g++){
                         int c_in = group_idx * channels_per_group + c_in_g;
 
@@ -379,131 +441,129 @@ struct ConvLayer {
                                 int in_i = i*stride + ki - padding;
                                 int in_j = j*stride + kj - padding;
                                 if(in_i>=0 && in_i<n && in_j>=0 && in_j<n){
-                                    // Gradient w.r.t input (dInput)
+                                    // Gradient for Input
                                     #pragma omp atomic
-                                    dInput[c_in][in_i][in_j] += grad * kernels[f][c_in_g][ki][kj];
+                                    dInput(c_in, in_i, in_j) += grad * kernels(f, c_in_g, ki, kj);
 
-                                    // Gradient w.r.t weight (kernel update)
-                                    kernels[f][c_in_g][ki][kj] -= lr*grad*lastInput[c_in][in_i][in_j];
+                                    // Gradient for Kernels
+                                    dKernels(f, c_in_g, ki, kj) += grad * lastInput(c_in, in_i, in_j);
                                 }
                             }
                     }
                 }
             }
         }
+        
+        // Adam Update with Weight Decay (L2 Regularization)
+        float lr_t = lr * std::sqrt(1.0f - std::pow(BETA2, t)) / (1.0f - std::pow(BETA1, t));
+
+        for(int i=0; i<kernels.size(); ++i) {
+            float dK = dKernels.data()[i];
+            float K_val = kernels.data()[i];
+
+            // Add Weight Decay (L2) to Gradient
+            dK += WEIGHT_DECAY * K_val;
+
+            // Adam Update
+            M_kernels.data()[i] = BETA1 * M_kernels.data()[i] + (1.0f - BETA1) * dK;
+            V_kernels.data()[i] = BETA2 * V_kernels.data()[i] + (1.0f - BETA2) * dK * dK;
+            kernels.data()[i] -= lr_t * M_kernels.data()[i] / (std::sqrt(V_kernels.data()[i]) + EPSILON);
+        }
+        
+        for(int i=0; i<numFilters; ++i) {
+            float dB = dBiases[i];
+            // Adam Update (Biases typically have no decay)
+            M_biases[i] = BETA1 * M_biases[i] + (1.0f - BETA1) * dB;
+            V_biases[i] = BETA2 * V_biases[i] + (1.0f - BETA2) * dB * dB;
+            biases[i] -= lr_t * M_biases[i] / (std::sqrt(V_biases[i]) + EPSILON);
+        }
 
         return dInput;
     }
 
-    void save(std::string prefix){
-        std::ofstream kfile(prefix + "_kernels.bin", std::ios::binary);
-        for(auto &f:kernels)
-            for(auto &c:f)
-                for(auto &row:c)
-                    kfile.write(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
-        kfile.close();
+    void save(const std::string& prefix) {
+        ofstream ofs(prefix + ".bin", ios::binary);
+        if (!ofs.is_open()) { cerr << "Cannot open " << prefix << ".bin for ConvLayer saving\n"; return; }
 
-        std::ofstream bfile(prefix + "_bias.bin", std::ios::binary);
-        bfile.write(reinterpret_cast<char*>(biases.data()), biases.size()*sizeof(float));
-        bfile.close();
+        int K_size = kernels.size();
+        int B_size = biases.size();
+
+        write_bin(ofs, &kernelSize, 1);
+        write_bin(ofs, &numFilters, 1);
+        write_bin(ofs, &inChannels, 1);
+        write_bin(ofs, &groups, 1);
+
+        write_bin(ofs, kernels.data(), K_size);
+        write_bin(ofs, biases.data(), B_size);
     }
+    
+    void load(const std::string& prefix) {
+        ifstream ifs(prefix + ".bin", ios::binary);
+        if (!ifs.is_open()) { cerr << "Cannot open " << prefix << ".bin for ConvLayer loading\n"; return; }
 
-    void load(std::string prefix){
-        std::ifstream kfile(prefix + "_kernels.bin", std::ios::binary);
-        for(auto &f:kernels)
-            for(auto &c:f)
-                for(auto &row:c)
-                    kfile.read(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
-        kfile.close();
+        int loaded_kSize, loaded_nFilters, loaded_inC, loaded_groups;
+        read_bin(ifs, &loaded_kSize, 1);
+        read_bin(ifs, &loaded_nFilters, 1);
+        read_bin(ifs, &loaded_inC, 1);
+        read_bin(ifs, &loaded_groups, 1);
 
-        std::ifstream bfile(prefix + "_bias.bin", std::ios::binary);
-        bfile.read(reinterpret_cast<char*>(biases.data()), biases.size()*sizeof(float));
-        bfile.close();
+        if (loaded_kSize != kernelSize || loaded_nFilters != numFilters || loaded_inC != inChannels || loaded_groups != groups) {
+            cerr << "Configuration mismatch in ConvLayer " << prefix << endl;
+            return;
+        }
+
+        read_bin(ifs, kernels.data(), kernels.size());
+        read_bin(ifs, biases.data(), biases.size());
     }
 };
 
 // ---------------- ConvNeXt Block ----------------
-// Represents the core ConvNeXt inverted bottleneck block
 struct ConvNeXtBlock {
     int channels;
-    // 1. Depthwise Conv 7x7 (large kernel)
     ConvLayer dwConv;
-    // 2. Layer Norm
     LayerNorm ln;
-    // 3. 1x1 Pointwise Expansion (ratio 4, Softplus/GELU)
-    ConvLayer pwConv1;
-    // 4. 1x1 Pointwise Projection (back to C channels, Identity)
-    ConvLayer pwConv2;
+    ConvLayer pwConv1; // Expansion
+    ConvLayer pwConv2; // Projection
 
     ConvNeXtBlock(int C, int expansion_ratio = 4)
         : channels(C),
-        // 1. Depthwise Conv: 7x7, groups=C (Depthwise), padding=3 (to keep size).
+        // 7x7 Depthwise Conv, Padding 3, Stride 1, Groups=C
         dwConv(C, 7, C, Activation::IDENTITY, 1, 3, C),
-        // 2. LayerNorm: applied to the output of DW Conv
         ln(C),
-        // 3. 1x1 Expansion: C in, 4*C out. SOFTPLUS (proxy for GELU) activation.
-        pwConv1(C, 1, C * expansion_ratio, Activation::SOFTPLUS, 1, 0, 1),
-        // 4. 1x1 Projection: 4*C in, C out. MUST be IDENTITY (no activation).
+        // 1x1 Pointwise Expansion, uses GELU
+        pwConv1(C, 1, C * expansion_ratio, Activation::GELU, 1, 0, 1),
+        // 1x1 Pointwise Projection, uses IDENTITY
         pwConv2(C * expansion_ratio, 1, C, Activation::IDENTITY, 1, 0, 1)
     {}
 
-    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input) {
-        // Residual Connection (Identity)
-        std::vector<std::vector<std::vector<float>>> residual = input;
+    Tensor3f forward(const Tensor3f& input) {
+        Tensor3f residual = input;
 
-        // 1. Depthwise Conv 7x7
-        std::vector<std::vector<std::vector<float>>> x = dwConv.forward(input);
-
-        // 2. Layer Normalization
+        Tensor3f x = dwConv.forward(input);
         x = ln.forward(x);
-
-        // 3. 1x1 Pointwise Expansion (Softplus/GELU)
         x = pwConv1.forward(x);
-
-        // 4. 1x1 Pointwise Projection (Linear/Identity)
         x = pwConv2.forward(x);
 
-        // 5. Add Residual (x + residual)
-        int C = x.size();
-        int H = x[0].size();
-        int W = x[0][0].size();
-
-        #pragma omp parallel for collapse(3)
-        for(int c=0; c<C; c++)
-            for(int i=0; i<H; i++)
-                for(int j=0; j<W; j++)
-                    x[c][i][j] += residual[c][i][j];
+        // Residual connection
+        x += residual;
 
         return x;
     }
 
-    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, float lr) {
+    Tensor3f backward(const Tensor3f& dOut, float lr, int t) {
+        Tensor3f dResidual = dOut;
+        Tensor3f dBlock = dOut;
 
-        std::vector<std::vector<std::vector<float>>> dResidual = dOut;
-        std::vector<std::vector<std::vector<float>>> dBlock = dOut;
+        // Backprop through MLP (pwConv2 -> pwConv1 -> ln)
+        dBlock = pwConv2.backward(dBlock, lr, t);
+        dBlock = pwConv1.backward(dBlock, lr, t);
+        dBlock = ln.backward(dBlock, lr, t);
+        
+        // Backprop through Depthwise Conv
+        dBlock = dwConv.backward(dBlock, lr, t);
 
-        // 1. Backprop 1x1 Projection (pwConv2)
-        dBlock = pwConv2.backward(dBlock, lr);
-
-        // 2. Backprop 1x1 Expansion (pwConv1)
-        dBlock = pwConv1.backward(dBlock, lr);
-
-        // 3. Backprop Layer Norm
-        dBlock = ln.backward(dBlock, lr);
-
-        // 4. Backprop Depthwise Conv (dwConv)
-        dBlock = dwConv.backward(dBlock, lr);
-
-        // 5. Combine with residual gradient (dBlock + dResidual)
-        int C = dBlock.size();
-        int H = dBlock[0].size();
-        int W = dBlock[0][0].size();
-
-        #pragma omp parallel for collapse(3)
-        for(int c=0; c<C; c++)
-            for(int i=0; i<H; i++)
-                for(int j=0; j<W; j++)
-                    dBlock[c][i][j] += dResidual[c][i][j];
+        // Add residual gradient
+        dBlock += dResidual;
 
         return dBlock;
     }
@@ -514,7 +574,7 @@ struct ConvNeXtBlock {
         pwConv1.save(prefix + "_pw1");
         pwConv2.save(prefix + "_pw2");
     }
-
+    
     void load(const std::string& prefix) {
         dwConv.load(prefix + "_dw");
         ln.load(prefix + "_ln");
@@ -523,524 +583,441 @@ struct ConvNeXtBlock {
     }
 };
 
-// ---------------- MaxPool Layer (kept for downsampling) ----------------
+// ---------------- Max Pooling ----------------
 struct MaxPool {
     int poolSize;
     int stride;
     int padding;
-    // Stores the (i, j) coordinates of the maximum value for each output cell
     std::vector<std::vector<std::vector<std::pair<int,int>>>> maxPos;
-    // FIX: Cache the original input dimensions for the backward pass
-    int lastH;
-    int lastW;
+    int lastH, lastW, F;
 
     MaxPool(int poolSize_ = 2, int stride_ = 2, int padding_ = 0)
-        : poolSize(poolSize_), stride(stride_), padding(padding_), lastH(0), lastW(0) {}
+        : poolSize(poolSize_), stride(stride_), padding(padding_), lastH(0), lastW(0), F(0) {}
 
-    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input)
+    Tensor3f forward(const Tensor3f& input)
     {
-        int F = input.size();
-        int H = input[0].size();
-        int W = input[0][0].size();
-        // FIX: Store input dimensions
-        lastH = H;
-        lastW = W;
+        F = input.dimension(0);
+        int H = input.dimension(1);
+        int W = input.dimension(2);
+        lastH = H; lastW = W;
 
         int outH = (H + 2*padding - poolSize) / stride + 1;
         int outW = (W + 2*padding - poolSize) / stride + 1;
 
-        maxPos.resize(F, std::vector<std::vector<std::pair<int,int>>>(outH, std::vector<std::pair<int,int>>(outW)));
+        maxPos.assign(F, std::vector<std::vector<std::pair<int,int>>>(outH, std::vector<std::pair<int,int>>(outW)));
 
-        std::vector<std::vector<std::vector<float>>> out(
-            F, std::vector<std::vector<float>>(outH, std::vector<float>(outW, 0)));
+        Tensor3f out(F, outH, outW);
 
-        #pragma omp parallel for
+        #pragma omp parallel for collapse(3)
         for(int f = 0; f < F; f++){
             for(int i = 0; i < outH; i++){
                 for(int j = 0; j < outW; j++){
-                    float m = -1e30f; // Very small number
+                    float m = -1e30f;
                     int max_i = -1, max_j = -1;
                     for(int pi = 0; pi < poolSize; pi++){
                         for(int pj = 0; pj < poolSize; pj++){
                             int in_i = i*stride + pi - padding;
                             int in_j = j*stride + pj - padding;
-                            float val = (in_i >= 0 && in_i < H && in_j >= 0 && in_j < W) ? input[f][in_i][in_j] : -1e30f;
+                            float val = (in_i >= 0 && in_i < H && in_j >= 0 && in_j < W) ? input(f, in_i, in_j) : -1e30f;
                             if(val > m){ m = val; max_i = in_i; max_j = in_j; }
                         }
                     }
-                    out[f][i][j] = m;
+                    out(f, i, j) = m;
                     maxPos[f][i][j] = {max_i, max_j};
                 }
             }
         }
-
         return out;
     }
 
-    // FIX: Removed origH, origW arguments and using cached lastH, lastW instead.
-    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut)
+    Tensor3f backward(const Tensor3f& dOut)
     {
-        int F = dOut.size();
-        // Use cached dimensions
         int origH = lastH;
         int origW = lastW;
 
-        std::vector<std::vector<std::vector<float>>> dInput(
-            F, std::vector<std::vector<float>>(origH, std::vector<float>(origW, 0)));
+        Tensor3f dInput(F, origH, origW); dInput.setZero();
 
-        #pragma omp parallel for
+        #pragma omp parallel for collapse(3)
         for(int f = 0; f < F; f++){
-            for(size_t i = 0; i < dOut[0].size(); i++){ // outH
-                for(size_t j = 0; j < dOut[0][0].size(); j++){ // outW
-                    // Use std::tie to extract the coordinates
+            for(size_t i = 0; i < dOut.dimension(1); i++){
+                for(size_t j = 0; j < dOut.dimension(2); j++){
                     int pi, pj;
                     std::tie(pi, pj) = maxPos[f][i][j];
-                    // Bounds check is technically only needed if maxPos could be outside origH/origW, but good practice
                     if(pi >= 0 && pj >= 0 && pi < origH && pj < origW)
-                        dInput[f][pi][pj] = dOut[f][i][j];
+                        dInput(f, pi, pj) = dOut(f, i, j);
                 }
             }
         }
-
         return dInput;
     }
+    // No parameters to save/load
 };
 
-// ---------------- Fully Connected Layer (kept for classification head) ----------------
+// ---------------- Fully Connected Layer ----------------
 struct FCLayer {
     int inSize, outSize;
-    std::vector<std::vector<float>> W;
-    std::vector<float> B;
-    std::vector<float> lastIn;
-    std::vector<float> lastPreActivation; // To store z = Wx + b
+    Matrixf W;
+    Vectorf B;
+    
+    // Adam moments
+    Matrixf M_W, V_W;
+    Vectorf M_B, V_B;
+
+    // Backward pass state
+    Vectorf lastIn;
+    Vectorf lastPreActivation;
     Activation act;
     float dropoutProb;
-    std::vector<bool> dropoutMask;
+    Vectorf dropoutMask;
 
     FCLayer(int inS, int outS, Activation act_ = Activation::SIGMOID, float dropout_=0.0f)
         : inSize(inS), outSize(outS), act(act_), dropoutProb(dropout_)
     {
-        W.resize(outSize, std::vector<float>(inSize));
-        B.resize(outSize, 0.0f);
-        for(int i=0; i<outSize; i++)
-            for(int j=0; j<inSize; j++)
-                W[i][j] = xavier_init(inS, outS);
+        W.resize(outS, inS);
+        B.resize(outS); B.setZero();
+        M_W.resize(outS, inSize); M_W.setZero();
+        V_W.resize(outS, inSize); V_W.setZero();
+        M_B.resize(outS); M_B.setZero();
+        V_B.resize(outS); V_B.setZero();
+        
+        std::mt19937 gen(std::random_device{}());
+        for(int i=0; i<outS; i++)
+            for(int j=0; j<inS; j++)
+                W(i, j) = xavier_init(inS, outS);
     }
 
-    std::vector<float> forward(const std::vector<float>& in, bool training=true){
+    Vectorf forward(const Vectorf& in, bool training=true){
         lastIn = in;
-        lastPreActivation.resize(outSize);
-        std::vector<float> out(outSize);
-        dropoutMask.clear();
-        dropoutMask.resize(outSize, true);
+        Vectorf z = W * in + B;
+        lastPreActivation = z;
+        Vectorf out(outSize);
+        dropoutMask.resize(outSize); dropoutMask.setOnes();
 
         for(int i=0; i<outSize; i++){
-            float s = 0;
-            for(int j=0; j<inSize; j++)
-                s += W[i][j] * in[j];
-            s += B[i];
-            lastPreActivation[i] = s;
-
-            // Activation
+            float s = z(i);
+            
             switch(act){
-                case Activation::RELU: out[i] = relu(s); break;
-                case Activation::SOFTPLUS: out[i] = softplus(s); break;
-                case Activation::SIGMOID: out[i] = sigmoid(s); break;
-                case Activation::IDENTITY: out[i] = s; break;
+                case Activation::RELU: out(i) = relu(s); break;
+                case Activation::GELU: out(i) = gelu(s); break;
+                case Activation::SIGMOID: out(i) = sigmoid(s); break;
+                case Activation::IDENTITY: out(i) = s; break;
             }
 
-            // Apply dropout if training
             if(training && dropoutProb > 0.0f){
-                // Using rand() for simplicity. Scale is 1/(1-p).
                 float scale = 1.0f / (1.0f - dropoutProb);
                 float r = ((float)rand() / (float)RAND_MAX);
                 if(r < dropoutProb){
-                    out[i] = 0;
-                    dropoutMask[i] = false;
+                    out(i) = 0;
+                    dropoutMask(i) = 0;
                 } else {
-                    out[i] *= scale; // Apply scaling to compensate for dropped units
+                    out(i) *= scale;
                 }
             }
         }
         return out;
     }
 
-    std::vector<float> backward(const std::vector<float>& grad, float lr){
-        std::vector<float> dInput(inSize,0);
+    Vectorf backward(const Vectorf& grad, float lr, int t){
+        Vectorf dInput(inSize); dInput.setZero();
+        // Matrixf dW(outSize, inSize); dW.setZero(); // Not needed as we update W directly
+        // Vectorf dB(outSize); dB.setZero(); // Not needed as we update B directly
 
-        // Calculate dL/dW and dL/dB (updates) and dL/dX (dInput)
+        // Adam learning rate with bias correction
+        float lr_t = lr * std::sqrt(1.0f - std::pow(BETA2, t)) / (1.0f - std::pow(BETA1, t));
+
+        #pragma omp parallel for
         for(int i=0; i<outSize; i++){
-            float g = grad[i];
+            float g = grad(i);
 
-            // Reapply dropout mask and scaling from forward pass
-            if(!dropoutMask[i]) {
+            if(dropoutMask(i) < 0.5f) {
                 g = 0.0f;
             } else if (dropoutProb > 0.0f) {
                 float scale = 1.0f / (1.0f - dropoutProb);
                 g *= scale;
             }
-
-
-            // Apply derivative of activation if NOT using BCE_grad with SIGMOID
-            float z = lastPreActivation[i];
-
-            switch(act){
-                case Activation::RELU: g *= relu_deriv(z); break;
-                case Activation::SOFTPLUS: g *= softplus_deriv(z); break;
-                case Activation::IDENTITY: g *= 1.0f; break;
-                // BCE_grad already calculates dL/dz = p-t, so no further activation derivative is needed for SIGMOID.
-                case Activation::SIGMOID: break;
+            
+            // Note: For SIGMOID output, the derivative is handled by BCE_grad, which returns (p-t).
+            // For other activations, we apply the derivative here.
+            if(act != Activation::SIGMOID) {
+                float z = lastPreActivation(i);
+                switch(act){
+                    case Activation::RELU: g *= relu_deriv(z); break;
+                    case Activation::GELU: g *= gelu_deriv(z); break;
+                    case Activation::IDENTITY: g *= 1.0f; break;
+                    case Activation::SIGMOID: break; 
+                }
             }
+
+            // Accumulate dB(i)
+            float dB_val = g;
+            // Adam Update for B(i) - no decay
+            M_B(i) = BETA1 * M_B(i) + (1.0f - BETA1) * dB_val;
+            V_B(i) = BETA2 * V_B(i) + (1.0f - BETA2) * dB_val * dB_val;
+            B(i) -= lr_t * M_B(i) / (std::sqrt(V_B(i)) + EPSILON);
 
             for(int j=0; j<inSize; j++){
-                dInput[j] += g * W[i][j];
-                W[i][j] -= lr * g * lastIn[j]; // Update weights
-            }
-            B[i] -= lr * g; // Update bias
-        }
+                // Calculate dW(i, j)
+                float dWij = g * lastIn(j);
+                
+                // Accumulate dInput (needs atomic for shared j index)
+                #pragma omp atomic
+                dInput(j) += g * W(i, j);
 
+                // Add Weight Decay (L2) to Gradient
+                dWij += WEIGHT_DECAY * W(i, j);
+
+                // Adam Update for W(i, j)
+                M_W(i, j) = BETA1 * M_W(i, j) + (1.0f - BETA1) * dWij;
+                V_W(i, j) = BETA2 * V_W(i, j) + (1.0f - BETA2) * dWij * dWij;
+                W(i, j) -= lr_t * M_W(i, j) / (std::sqrt(V_W(i, j)) + EPSILON);
+            }
+        }
+        
         return dInput;
     }
-    
-    void expandOutputs(int newOutSize) {
-        if(newOutSize <= outSize) return;
-    
-        std::vector<std::vector<float>> newW(newOutSize, std::vector<float>(inSize));
-        std::vector<float> newB(newOutSize, 0.0f);
-        
-        for(int i=0;i<outSize;i++){
-            for(int j=0;j<inSize;j++)
-                newW[i][j] = W[i][j];
-            newB[i] = B[i];
-        }
-        
-        for(int i=outSize;i<newOutSize;i++){
-            for(int j=0;j<inSize;j++)
-                newW[i][j] = xavier_init(inSize, newOutSize);
-            newB[i] = 0.0f;
-        }
-    
-        W = std::move(newW);
-        B = std::move(newB);
-        outSize = newOutSize;
-    
-        std::cout << "FC layer expanded to " << outSize << " outputs.\n";
-    }
-    
-    void save(const std::string& prefix){
-        std::ofstream wfile(prefix + "_weights.bin", std::ios::binary);
-        for(auto &row: W)
-            wfile.write(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
-        wfile.close();
 
-        std::ofstream bfile(prefix + "_bias.bin", std::ios::binary);
-        bfile.write(reinterpret_cast<char*>(B.data()), B.size()*sizeof(float));
-        bfile.close();
+    void save(const std::string& prefix) {
+        ofstream ofs(prefix + ".bin", ios::binary);
+        if (!ofs.is_open()) { cerr << "Cannot open " << prefix << ".bin for FCLayer saving\n"; return; }
+
+        int W_rows = W.rows();
+        int W_cols = W.cols();
+        int B_size = B.size();
+
+        write_bin(ofs, &W_rows, 1);
+        write_bin(ofs, &W_cols, 1);
+        write_bin(ofs, &B_size, 1);
+
+        write_bin(ofs, W.data(), W.size());
+        write_bin(ofs, B.data(), B.size());
     }
 
-    void load(const std::string& prefix){
-        std::ifstream wfile(prefix + "_weights.bin", std::ios::binary);
-        for(auto &row: W)
-            wfile.read(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
-        wfile.close();
+    void load(const std::string& prefix) {
+        ifstream ifs(prefix + ".bin", ios::binary);
+        if (!ifs.is_open()) { cerr << "Cannot open " << prefix << ".bin for FCLayer loading\n"; return; }
 
-        std::ifstream bfile(prefix + "_bias.bin", std::ios::binary);
-        bfile.read(reinterpret_cast<char*>(B.data()), B.size()*sizeof(float));
-        bfile.close();
+        int loaded_W_rows, loaded_W_cols, loaded_B_size;
+        read_bin(ifs, &loaded_W_rows, 1);
+        read_bin(ifs, &loaded_W_cols, 1);
+        read_bin(ifs, &loaded_B_size, 1);
+        
+        if (loaded_W_rows != W.rows() || loaded_W_cols != W.cols() || loaded_B_size != B.size()) {
+            cerr << "Weight size mismatch in FC layer " << prefix << endl;
+            return;
+        }
+
+        read_bin(ifs, W.data(), W.size());
+        read_bin(ifs, B.data(), B.size());
     }
 };
 
-// ---------------- Helper Functions ----------------
-vector<float> BCE_grad(const vector<float>& p, const vector<float>& t){
-    vector<float> g(p.size());
-    for(size_t i=0;i<p.size();i++){
-        float pi = std::clamp(p[i], 1e-7f, 1.0f-1e-7f);
-        g[i] = pi - t[i];
+// ---------------- Loss and Metrics ----------------
+
+// Derivative of Binary Cross-Entropy (BCE) Loss with Sigmoid
+// dL/dp = p - t
+Vectorf BCE_grad(const Vectorf& p, const Vectorf& t){
+    Vectorf g(p.size());
+    for(int i=0;i<p.size();i++){
+        // Clamp prediction to prevent log(0)
+        float pi = std::clamp(p(i), 1e-7f, 1.0f-1e-7f);
+        g(i) = pi - t(i); 
     }
     return g;
 }
 
-void save_tags(const map<string,int>& tag2idx, const string& prefix){
-    json j;
-    for(auto &p: tag2idx) j[p.first] = p.second;
-    ofstream f(prefix + "_tags.json");
-    f << j.dump(4);
-    f.close();
-}
-
-void load_tags(map<string,int>& tag2idx, const string& prefix){
-    ifstream f(prefix + "_tags.json");
-    if(!f.is_open()){ cerr << "Cannot open tag file\n"; return; }
-    json j; f >> j;
-    tag2idx.clear();
-    for(auto &item: j.items()){
-        tag2idx[item.key()] = item.value();
-    }
-    f.close();
-}
-
-
-vector<vector<vector<float>>> load_image_resized(string path, int targetSize){
-    int w, h, c;
-    unsigned char* img = stbi_load(path.c_str(), &w, &h, &c, 3);
-    if(!img){ cerr << "Failed to load " << path << endl; exit(1); }
-    
-    vector<vector<vector<float>>> out(3, vector<vector<float>>(targetSize, vector<float>(targetSize, 0)));
-    const float inv255 = 1.0f / 255.0f;
-    
-    for(int i=0; i<targetSize; i++){
-        float fx = i * (h-1.0f)/(targetSize-1.0f); int x0 = (int)fx, x1 = min(x0+1, h-1); float dx = fx - x0;
-        for(int j=0; j<targetSize; j++){
-            float fy = j * (w-1.0f)/(targetSize-1.0f); int y0 = (int)fy, y1 = min(y0+1, w-1); float dy = fy - y0;
-
-            for(int ch=0; ch<3; ch++){
-                float v00 = img[(x0*w + y0)*3 + ch]*inv255;
-                float v01 = img[(x0*w + y1)*3 + ch]*inv255;
-                float v10 = img[(x1*w + y0)*3 + ch]*inv255;
-                float v11 = img[(x1*w + y1)*3 + ch]*inv255;
-                
-                out[ch][i][j] = (1-dx)*(1-dy)*v00 + (1-dx)*dy*v01 + dx*(1-dy)*v10 + dx*dy*v11;
-            }
-        }
-    }
-    
-    for(int ch=0; ch<3; ch++)
-        for(int i=0; i<targetSize; i++)
-            for(int j=0; j<targetSize; j++)
-                out[ch][i][j] = (out[ch][i][j] - 0.5f) / 0.5f;
-
-    stbi_image_free(img);
-    return out;
-}
-
-using Image = vector<vector<vector<float>>>;
-
-// ---------------- Compose augmentation ---------------- //
-Image augment_image(const Image& img) {
-    thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-
-    Image out = img;
-    int C = img.size();
-    int H = img[0].size();
-    int W = img[0][0].size();
-    
-    if (C != 3) { /* Handle error or different channel count if needed */ }
-
-    // ---- Horizontal Flip ----
-    if (uniform(rng) < 0.5f) {
-        for (int c = 0; c < C; c++)
-            for (int h = 0; h < H; h++)
-                for (int w = 0; w < W / 2; w++)
-                    std::swap(out[c][h][w], out[c][h][W - 1 - w]);
-    }
-
-    // ---- Rotate 90 degrees clockwise ----
-    if (uniform(rng) < 0.5f) {
-        Image rotated(C, vector<vector<float>>(W, vector<float>(H)));
-        for (int c = 0; c < C; c++)
-            for (int h = 0; h < H; h++)
-                for (int w = 0; w < W; w++)
-                    rotated[c][w][H - 1 - h] = out[c][h][w];
-        out = std::move(rotated);
-        std::swap(H, W); // Update height and width after rotation
-    }
-
-    // ---- Color jitter (brightness + contrast) ----
-    float brightness = 0.2f;
-    float contrast = 0.2f;
-    float b = (uniform(rng) * 2 - 1) * brightness; // [-brightness, brightness]
-    float c = 1.0f + (uniform(rng) * 2 - 1) * contrast; // [1-contrast, 1+contrast]
-
-    for (int ch = 0; ch < C; ch++)
-        for (int h = 0; h < H; h++)
-            for (int w = 0; w < W; w++) {
-                float val = out[ch][h][w] * c + b;
-                out[ch][h][w] = std::min(std::max(val, -1.0f), 1.0f); 
-            }
-
-    return out;
-}
-
-void load_dataset(const string& folder,
-                  vector<vector<vector<vector<float>>>>& X,
-                  vector<vector<float>>& Y,
-                  map<string,int>& tag2idx,
-                  int targetSize)
-{
-    ifstream tfile(folder + "/tags.json");
-    if(!tfile.is_open()){ cerr<<"Cannot open tags.json\n"; exit(1);}
-    json j; tfile >> j;
-
-    int numTags = 0;
-    for(auto &f:j.items())
-        for(auto &img:f.value().items())
-            for(auto &tag:img.value())
-                if(tag2idx.find(tag) == tag2idx.end())
-                    tag2idx[tag] = numTags++;
-
-    for(auto &f:j.items())
-        for(auto &img:f.value().items()){
-            string path = folder + "/" + f.key() + "/" + img.key();
-            // Use the renamed/updated image loading function
-            auto imgRGB = load_image_resized(path, targetSize);
-            // Augment image after resizing
-            imgRGB = augment_image(imgRGB);
-            X.push_back(imgRGB);
-
-            vector<float> multi(tag2idx.size(), 0.0f);
-            for(auto &tag: img.value())
-                multi[tag2idx[tag]] = 1.0f;
-            Y.push_back(multi);
-        }
-}
-
-struct Dataset {
-    vector<vector<vector<vector<float>>>> X; // [N][C][H][W]
-    vector<vector<float>> Y;                 // [N][num_labels]
-    int N, C, H, W, num_labels;
-};
-
-Dataset load_dataset_bin(const string& folder_path, map<string,int>& tag2idx) {
-    Dataset data;
-
-    // Tags file
-    string tag_file = folder_path + "/tags.json";
-    ifstream ftag(tag_file);
-    if(!ftag.is_open()){
-        cerr << "Cannot open tag file " << tag_file << "\n"; 
-        exit(1);
-    }
-
-    json j; 
-    ftag >> j;
-    tag2idx.clear();
-    for(auto &item: j.items()) 
-        tag2idx[item.key()] = item.value();
-    ftag.close();
-
-    // Dataset file
-    string bin_path = folder_path + "/dataset.bin";
-    ifstream fin(bin_path, ios::binary);
-    if(!fin.is_open()){ 
-        cerr << "Cannot open dataset file " << bin_path << "\n"; 
-        exit(1); 
-    }
-
-    // Read header
-    fin.read((char*)&data.N, sizeof(int));
-    fin.read((char*)&data.C, sizeof(int));
-    fin.read((char*)&data.H, sizeof(int));
-    fin.read((char*)&data.W, sizeof(int));
-    fin.read((char*)&data.num_labels, sizeof(int));
-
-    data.X.resize(data.N, vector<vector<vector<float>>>(data.C, vector<vector<float>>(data.H, vector<float>(data.W))));
-    data.Y.resize(data.N, vector<float>(data.num_labels));
-
-    for(int i=0;i<data.N;i++){
-        for(int c=0;c<data.C;c++)
-            for(int h=0;h<data.H;h++)
-                for(int w=0;w<data.W;w++)
-                    fin.read((char*)&data.X[i][c][h][w], sizeof(float));
-
-        for(int l=0;l<data.num_labels;l++)
-            fin.read((char*)&data.Y[i][l], sizeof(float));
-    }
-
-    fin.close();
-    cout << "Loaded " << data.N << " images of size " 
-         << data.C << "x" << data.H << "x" << data.W 
-         << " with " << data.num_labels << " labels.\n";
-
-    return data;
-}
-
-float multilabel_accuracy(const vector<float>& pred, const vector<float>& target, float threshold=0.5f){
+// Calculate multilabel accuracy (F1-score like metric based on threshold)
+float multilabel_accuracy(const Vectorf& pred, const Vectorf& target, float threshold=0.5f){
     int correct=0, total=0;
-    for(size_t i=0; i<pred.size(); i++){
-        bool p = pred[i] > threshold;
-        bool t = target[i] > 0.5f;
+    for(int i=0; i<pred.size(); i++){
+        bool p = pred(i) > threshold;
+        bool t = target(i) > 0.5f;
         if(p==t) correct++;
         total++;
     }
     return correct/(float)total;
 }
 
-// ---------------- MAIN ----------------
-int main(int argc,char **argv){
-    // Seed RNGs
-    srand(time(0));
-    random_device rd; mt19937 g(rd());
+// ---------------- Data Handling ----------------
 
-    vector<vector<vector<vector<float>>>> X; // Dataset images
-    vector<vector<float>> Y;                 // Dataset labels
-    map<string,int> tag2idx;                 // Tag name to index
+struct Dataset {
+    vector<Tensor3f> X;
+    vector<Vectorf> Y;
+    int N, C, H, W, num_labels;
+};
 
-    string dataFolder = "Data";
-    string loadModelFolder = "";
-    bool freeze_base = false;
-    int epochs = 50;
-    float lr = 0.005f;
-    int batchSize = 2;
-    int numThreads = 4;
-    int imageSize = 128;
-
-    // Command line arguments
-    for(int i=1;i<argc;i++){
-        string arg=argv[i];
-        if(arg=="--data" && i+1<argc){ dataFolder = argv[i+1]; i++; }
-        else if(arg=="--epochs" && i+1<argc){ epochs = stoi(argv[i+1]); i++; }
-        else if(arg=="--lr" && i+1<argc){ lr = stof(argv[i+1]); i++; }
-        else if(arg=="--batch" && i+1<argc){ batchSize = stoi(argv[i+1]); i++; }
-        else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
-        else if(arg=="--load-model" && i+1<argc){ loadModelFolder = argv[i+1]; i++; }
-        else if(arg=="--size" && i+1<argc){ imageSize = stoi(argv[i+1]); i++; }
+// Function to load the pre-processed binary dataset
+Dataset load_dataset_bin(const string& folder_path, map<string,int>& tag2idx) {
+    Dataset data;
+    string tag_file = folder_path + "/tags.json";
+    ifstream ftag(tag_file);
+    if(!ftag.is_open()){
+        cerr << "Cannot open tag file " << tag_file << "\n";
+        exit(1);
     }
 
-    omp_set_num_threads(numThreads);
-    cout << "Using " << numThreads << " OpenMP threads\n";
-    cout << "Batch size set to: " << batchSize << endl;
+    json j;
+    ftag >> j;
+    tag2idx.clear();
+    for(auto &item: j.items())
+        tag2idx[item.key()] = item.value();
+    ftag.close();
 
-    // ---------------- Load dataset ----------------
-    cout << "Loading dataset from folder: " << dataFolder << "\n";
-    Dataset data = load_dataset_bin(dataFolder, tag2idx);
-    X = std::move(data.X);
-    Y = std::move(data.Y);
-    imageSize = data.H;
-
-    // ---------------- Check data ----------------
-    if (X.empty()) {
-        cerr << "Error: No data loaded. Exiting.\n";
-        return 1;
+    string bin_path = folder_path + "/dataset.bin";
+    ifstream fin(bin_path, ios::binary);
+    if(!fin.is_open()){
+        cerr << "Cannot open dataset file " << bin_path << "\n";
+        exit(1);
     }
 
-    // --- ConvNeXt Base-like Architecture ---
-    const int C1 = 64;
-    const int C2 = 128;
-    const int C3 = 256;
-    const int C4 = 512;
+    // Read header information
+    read_bin(fin, &data.N, 1);
+    read_bin(fin, &data.C, 1);
+    read_bin(fin, &data.H, 1);
+    read_bin(fin, &data.W, 1);
+    read_bin(fin, &data.num_labels, 1);
 
-    ConvLayer stem_conv(3, 4, C1, Activation::IDENTITY, 4, 0, 1);
-    LayerNorm stem_ln(C1);
-    ConvNeXtBlock block1(C1);
+    // Read data
+    for(int i=0;i<data.N;i++){
+        Tensor3f img(data.C, data.H, data.W);
+        Vectorf labels(data.num_labels);
+        read_bin(fin, img.data(), img.size());
+        read_bin(fin, labels.data(), labels.size());
+        data.X.push_back(std::move(img));
+        data.Y.push_back(std::move(labels));
+    }
 
-    MaxPool downsample2(2, 2);
-    ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1);
-    ConvNeXtBlock block2(C2);
+    fin.close();
+    cout << "Loaded " << data.N << " images of size "
+         << data.C << "x" << data.H << "x" << data.W
+         << " with " << data.num_labels << " labels.\n";
 
-    MaxPool downsample3(2, 2);
-    ConvLayer expand3(C2, 1, C3, Activation::IDENTITY, 1, 0, 1);
-    ConvNeXtBlock block3(C3);
+    return data;
+}
 
-    MaxPool downsample4(2, 2);
-    ConvLayer expand4(C3, 1, C4, Activation::IDENTITY, 1, 0, 1);
-    ConvNeXtBlock block4(C4);
+void save_tags(const map<string,int>& tag2idx, const string& prefix){
+    if(tag2idx.empty()){
+        cerr << "[WARN] save_tags(): tag map is empty, nothing to save\n";
+        return;
+    }
 
-    // Dry run to compute FC input size
-    int fcInputSize = 0;
-    int feature_H=0, feature_W=0;
-    {
-        auto s = stem_conv.forward(X[0]);
+    json j;
+    for(const auto& p : tag2idx){
+        j[p.first] = p.second;
+    }
+
+    string path = prefix + "_tags.json";
+    ofstream f(path);
+    if(!f.is_open()){
+        cerr << "[ERROR] Failed to open tag file for writing: " << path << "\n";
+        return;
+    }
+
+    try {
+        f << j.dump(4);
+    } catch(const json::exception& e){
+        cerr << "[ERROR] JSON write failed: " << e.what() << "\n";
+    }
+
+    f.close();
+    cout << "Saved tags: " << path << " (" << tag2idx.size() << " tags)\n";
+}
+
+void load_tags(map<string,int>& tag2idx, const string& prefix){
+    string path = prefix + "_tags.json";
+    ifstream f(path);
+    if(!f.is_open()){
+        cerr << "[ERROR] Cannot open tag file: " << path << "\n";
+        return;
+    }
+
+    json j;
+    try {
+        f >> j;
+    } catch(const json::exception& e){
+        cerr << "[ERROR] Failed to parse tag JSON: " << e.what() << "\n";
+        f.close();
+        return;
+    }
+
+    if(!j.is_object()){
+        cerr << "[ERROR] Tag file is not a JSON object: " << path << "\n";
+        f.close();
+        return;
+    }
+
+    tag2idx.clear();
+    for(const auto& item : j.items()){
+        if(!item.value().is_number_integer()){
+            cerr << "[WARN] Skipping invalid tag entry: " << item.key() << "\n";
+            continue;
+        }
+        tag2idx[item.key()] = item.value().get<int>();
+    }
+
+    if(tag2idx.empty()){
+        cerr << "[WARN] Tag file loaded but contains no valid entries\n";
+    } else {
+        cout << "Loaded tags: " << tag2idx.size() << " tags\n";
+    }
+
+    f.close();
+}
+
+// ---------------- Training Helpers ----------------
+
+// Helper function to save all model weights
+void save_all_weights(const std::string& modelName,
+                      ConvLayer& stem_conv, LayerNorm& stem_ln, ConvNeXtBlock& block1,
+                      ConvLayer& expand2, ConvNeXtBlock& block2, ConvLayer& expand3,
+                      ConvNeXtBlock& block3, ConvLayer& expand4, ConvNeXtBlock& block4,
+                      FCLayer& classifier) {
+    stem_conv.save(modelName + "_stem_conv");
+    stem_ln.save(modelName + "_stem_ln");
+    block1.save(modelName + "_block1");
+    expand2.save(modelName + "_expand2");
+    block2.save(modelName + "_block2");
+    expand3.save(modelName + "_expand3");
+    block3.save(modelName + "_block3");
+    expand4.save(modelName + "_expand4");
+    block4.save(modelName + "_block4");
+    classifier.save(modelName + "_classifier");
+}
+
+// Helper function to load all model weights
+void load_all_weights(const std::string& modelName,
+                      ConvLayer& stem_conv, LayerNorm& stem_ln, ConvNeXtBlock& block1,
+                      ConvLayer& expand2, ConvNeXtBlock& block2, ConvLayer& expand3,
+                      ConvNeXtBlock& block3, ConvLayer& expand4, ConvNeXtBlock& block4,
+                      FCLayer& classifier) {
+    stem_conv.load(modelName + "_stem_conv");
+    stem_ln.load(modelName + "_stem_ln");
+    block1.load(modelName + "_block1");
+    expand2.load(modelName + "_expand2");
+    block2.load(modelName + "_block2");
+    expand3.load(modelName + "_expand3");
+    block3.load(modelName + "_block3");
+    expand4.load(modelName + "_expand4");
+    block4.load(modelName + "_block4");
+    classifier.load(modelName + "_classifier");
+}
+
+
+// Function to run a full inference pass on a dataset partition (for evaluation)
+std::pair<float, float> evaluate_model(
+    const std::vector<Tensor3f>& X, const std::vector<Vectorf>& Y,
+    ConvLayer& stem_conv, LayerNorm& stem_ln, ConvNeXtBlock& block1, MaxPool& downsample2,
+    ConvLayer& expand2, ConvNeXtBlock& block2, MaxPool& downsample3, ConvLayer& expand3,
+    ConvNeXtBlock& block3, MaxPool& downsample4, ConvLayer& expand4, ConvNeXtBlock& block4,
+    GlobalAvgPool& gap, FCLayer& classifier) 
+{
+    float totalLoss = 0.0f;
+    float totalAcc = 0.0f;
+    size_t count = X.size();
+
+    #pragma omp parallel for reduction(+:totalLoss, totalAcc)
+    for(size_t i = 0; i < count; i++) {
+        // Forward pass (Testing Mode)
+        auto s = stem_conv.forward(X[i]);
         s = stem_ln.forward(s);
         s = block1.forward(s);
         s = downsample2.forward(s);
@@ -1052,78 +1029,162 @@ int main(int argc,char **argv){
         s = downsample4.forward(s);
         s = expand4.forward(s);
         s = block4.forward(s);
-
-        feature_H = s[0].size();
-        feature_W = s[0][0].size();
-        fcInputSize = s.size() * feature_H * feature_W;
-    }
-
-    FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID);
-    string modelName = "convnext_base";
-
-    // --- Load model for incremental training if folder specified ---
-    if(!loadModelFolder.empty()) {
-        cout << "Loading model from folder: " << loadModelFolder << "\n";
-    
-        // Load ConvNeXt base layers
-        stem_conv.load(loadModelFolder + "/stem_conv");
-        stem_ln.load(loadModelFolder + "/stem_ln");
-        block1.load(loadModelFolder + "/block1");
-        expand2.load(loadModelFolder + "/expand2");
-        block2.load(loadModelFolder + "/block2");
-        expand3.load(loadModelFolder + "/expand3");
-        block3.load(loadModelFolder + "/block3");
-        expand4.load(loadModelFolder + "/expand4");
-        block4.load(loadModelFolder + "/block4");
-        classifier.load(loadModelFolder + "/fc");
         
-        map<string,int> oldTags;
-        load_tags(oldTags, loadModelFolder + "/" + modelName);
-    
-        for(auto &p : oldTags){
-            if(tag2idx.find(p.first) == tag2idx.end()){
-                tag2idx[p.first] = tag2idx.size();
-            }
+        Vectorf pooled = gap.forward(s);
+        Vectorf pred = classifier.forward(pooled, false); // Training=false (No dropout)
+        
+        // Loss calculation
+        for(int k=0;k<pred.size();k++){
+            float p_k = std::clamp(pred(k), 1e-7f, 1.0f-1e-7f);
+            totalLoss += Y[i](k) > 0.5f ? -std::log(p_k) : -std::log(1.0f-p_k);
         }
-    
-        freeze_base = true;
+        
+        totalAcc += multilabel_accuracy(pred, Y[i]);
     }
-    
-    int oldFCsize = classifier.outSize;
-    int newFCsize = tag2idx.size();
-    if(newFCsize > oldFCsize){
-        classifier.expandOutputs(newFCsize);
-    }
-    
-    cout << "Network initialized. Output feature map: " << C4 << "x" << feature_H << "x" << feature_W << "\n";
-    cout << "Input size to FC: " << fcInputSize << " (C=" << C4 << ")\n";
 
-    // ---------------- Training loop ----------------
+    return {totalLoss / count, totalAcc / count};
+}
+
+// ---------------- Main Training Function ----------------
+
+int main(int argc,char **argv){
+    srand(time(0));
+    random_device rd; mt19937 g(rd());
+
+    map<string,int> tag2idx;
+
+    // --- Training Configuration ---
+    string dataFolder = "Data";
+    string modelName = "model";
+    string loadModelName = "";
+    bool freeze_base = false;
+    int epochs = 50;
+    float base_lr = 0.0005f; 
+    int batchSize = 2;
+    int numThreads = 4;
+    float warmup_epochs = 5.0f; // 5 epochs of linear warmup
+    float val_ratio = 0.2f; // 20% for validation
+
+    for(int i=1;i<argc;i++){
+        string arg=argv[i];
+        if(arg=="--data" && i+1<argc){ dataFolder = argv[i+1]; i++; }
+        else if(arg=="--model-name" && i+1<argc){ modelName = argv[i+1]; i++; }
+        else if(arg=="--epochs" && i+1<argc){ epochs = stoi(argv[i+1]); i++; }
+        else if(arg=="--lr" && i+1<argc){ base_lr = stof(argv[i+1]); i++; }
+        else if(arg=="--batch" && i+1<argc){ batchSize = stoi(argv[i+1]); i++; }
+        else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
+        else if(arg=="--load-model" && i+1<argc){ loadModelName = argv[i+1]; i++; }
+        else if(arg=="--freeze"){ freeze_base = true; }
+        else if(arg=="--val-ratio" && i+1<argc){ val_ratio = stof(argv[i+1]); i++; }
+    }
+
+    omp_set_num_threads(numThreads);
+    Eigen::setNbThreads(numThreads);
+
+    cout << "Using " << numThreads << " OpenMP threads\n";
+    cout << "Batch size set to: " << batchSize << endl;
+    cout << "Base LR: " << base_lr << ", Warmup Epochs: " << warmup_epochs << ", Total Epochs: " << epochs << endl;
+
+    cout << "Loading dataset from folder: " << dataFolder << "\n";
+    Dataset full_data = load_dataset_bin(dataFolder, tag2idx);
+
+    if (full_data.X.empty()) {
+        cerr << "Error: No data loaded. Exiting.\n";
+        return 1;
+    }
+
+    // --- Data Splitting ---
+    vector<Tensor3f> train_X, val_X;
+    vector<Vectorf> train_Y, val_Y;
+    
+    vector<int> all_indices(full_data.N);
+    iota(all_indices.begin(), all_indices.end(), 0);
+    shuffle(all_indices.begin(), all_indices.end(), g);
+
+    size_t val_size = static_cast<size_t>(full_data.N * val_ratio);
+    size_t train_size = full_data.N - val_size;
+    
+    cout << "Splitting data: Train size = " << train_size << ", Validation size = " << val_size << endl;
+
+    for (size_t i = 0; i < full_data.N; ++i) {
+        if (i < train_size) {
+            train_X.push_back(std::move(full_data.X[all_indices[i]]));
+            train_Y.push_back(std::move(full_data.Y[all_indices[i]]));
+        } else {
+            val_X.push_back(std::move(full_data.X[all_indices[i]]));
+            val_Y.push_back(std::move(full_data.Y[all_indices[i]]));
+        }
+    }
+    
+    // Release full_data memory
+    full_data.X.clear();
+    full_data.Y.clear();
+
+
+    // --- ConvNeXt Tiny-like Architecture Channels ---
+    const int C1 = 64;
+    const int C2 = 128;
+    const int C3 = 256;
+    const int C4 = 512;
+
+    // --- Model Definition ---
+    // 1. Stem: 4x4, stride 4
+    ConvLayer stem_conv(full_data.C, 4, C1, Activation::IDENTITY, 4, 0, 1);
+    LayerNorm stem_ln(C1);
+    
+    // 2. Stage 1 (Resolution / 4)
+    ConvNeXtBlock block1(C1);
+
+    // 3. Stage 2 Downsampling (Resolution / 8)
+    MaxPool downsample2(2, 2);
+    ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1);
+    ConvNeXtBlock block2(C2);
+
+    // 4. Stage 3 Downsampling (Resolution / 16)
+    MaxPool downsample3(2, 2);
+    ConvLayer expand3(C2, 1, C3, Activation::IDENTITY, 1, 0, 1);
+    ConvNeXtBlock block3(C3);
+
+    // 5. Stage 4 Downsampling (Resolution / 32)
+    MaxPool downsample4(2, 2);
+    ConvLayer expand4(C3, 1, C4, Activation::IDENTITY, 1, 0, 1);
+    ConvNeXtBlock block4(C4);
+
+    // 6. Head
+    GlobalAvgPool gap;
+    int fcInputSize = C4;
+
+    FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID, 0.2f); // Add 20% Dropout
+
+    // --- Model Loading ---
+    if (!loadModelName.empty()) {
+        cout << "Loading model weights from " << loadModelName << "...\n";
+        load_all_weights(loadModelName, stem_conv, stem_ln, block1, expand2, block2, expand3, block3, expand4, block4, classifier);
+    }
+    
+    // --- Checkpointing variables ---
+    float best_val_acc = -1.0f;
+
+
+    // --- Training Loop ---
+    long long global_step = 1;
+
     for(int e=0; e<epochs; e++){
+        // Calculate Learning Rate using Cosine Annealing Schedule
+        float lr_epoch = cosine_annealing_lr(base_lr, e, epochs, warmup_epochs);
+
         float totalLoss = 0;
 
-        // Shuffle indices
-        vector<int> indices(X.size());
+        vector<int> indices(train_X.size());
         iota(indices.begin(), indices.end(), 0);
         shuffle(indices.begin(), indices.end(), g);
 
-        for(size_t i=0;i<X.size();i+=batchSize){
-            vector<vector<vector<vector<float>>>> batch_inputs;
-            vector<vector<float>> batch_targets;
-            vector<vector<float>> batch_preds;
-            vector<vector<float>> all_dInput_fc;
-
-            int currentBatchSize = 0;
-            for(int b=0;b<batchSize && i+b<X.size();b++){
+        for(size_t i=0;i<train_X.size();i+=batchSize){
+            for(int b=0;b<batchSize && i+b<train_X.size();b++){
                 int idx = indices[i+b];
-                batch_inputs.push_back(X[idx]);
-                batch_targets.push_back(Y[idx]);
-                currentBatchSize++;
-            }
 
-            // Forward pass
-            for(int b=0;b<currentBatchSize;b++){
-                auto s = stem_conv.forward(batch_inputs[b]);
+                // --- Forward Pass (Training Mode) ---
+                auto s = stem_conv.forward(train_X[idx]);
                 s = stem_ln.forward(s);
                 s = block1.forward(s);
                 s = downsample2.forward(s);
@@ -1135,86 +1196,83 @@ int main(int argc,char **argv){
                 s = downsample4.forward(s);
                 s = expand4.forward(s);
                 s = block4.forward(s);
+                
+                // Head
+                Vectorf pooled = gap.forward(s);
+                Vectorf pred = classifier.forward(pooled, true); // Training=true
 
-                auto flat = flatten(s);
-                auto pred = classifier.forward(flat);
-                batch_preds.push_back(pred);
-
-                auto grad_fc = BCE_grad(pred, batch_targets[b]);
-                for(size_t k=0;k<pred.size();k++){
-                    float p_k = std::clamp(pred[k], 1e-7f, 1.0f-1e-7f);
-                    totalLoss += batch_targets[b][k] > 0.5f ? -std::log(p_k) : -std::log(1.0f-p_k);
+                // --- Loss and Gradient Calculation ---
+                Vectorf grad_fc = BCE_grad(pred, train_Y[idx]);
+                
+                // Accumulate Loss
+                for(int k=0;k<pred.size();k++){
+                    float p_k = std::clamp(pred(k), 1e-7f, 1.0f-1e-7f);
+                    totalLoss += train_Y[idx](k) > 0.5f ? -std::log(p_k) : -std::log(1.0f-p_k);
                 }
-                all_dInput_fc.push_back(grad_fc);
-            }
+                
+                // --- Backward Pass and Update ---
+                int H = s.dimension(1);
+                int W = s.dimension(2);
+                
+                global_step++; // Increment step for Adam's bias correction
 
-            // Backward pass
-            for(int b=0;b<currentBatchSize;b++){
-                auto dFlat = classifier.backward(all_dInput_fc[b], lr/currentBatchSize);
-                auto dConv = unflatten(dFlat, C4, feature_H, feature_W);
+                Vectorf dPooled = classifier.backward(grad_fc, lr_epoch, global_step);
+                Tensor3f dConv = gap.backward(dPooled, H, W);
 
                 if(!freeze_base) {
-                    dConv = block4.backward(dConv, lr/currentBatchSize);
-                    dConv = expand4.backward(dConv, lr/currentBatchSize);
+                    dConv = block4.backward(dConv, lr_epoch, global_step);
+                    dConv = expand4.backward(dConv, lr_epoch, global_step);
                     dConv = downsample4.backward(dConv);
 
-                    dConv = block3.backward(dConv, lr/currentBatchSize);
-                    dConv = expand3.backward(dConv, lr/currentBatchSize);
+                    dConv = block3.backward(dConv, lr_epoch, global_step);
+                    dConv = expand3.backward(dConv, lr_epoch, global_step);
                     dConv = downsample3.backward(dConv);
 
-                    dConv = block2.backward(dConv, lr/currentBatchSize);
-                    dConv = expand2.backward(dConv, lr/currentBatchSize);
+                    dConv = block2.backward(dConv, lr_epoch, global_step);
+                    dConv = expand2.backward(dConv, lr_epoch, global_step);
                     dConv = downsample2.backward(dConv);
 
-                    dConv = block1.backward(dConv, lr/currentBatchSize);
-                    dConv = stem_ln.backward(dConv, lr/currentBatchSize);
-                    dConv = stem_conv.backward(dConv, lr/currentBatchSize);
+                    dConv = block1.backward(dConv, lr_epoch, global_step);
+                    dConv = stem_ln.backward(dConv, lr_epoch, global_step);
+                    dConv = stem_conv.backward(dConv, lr_epoch, global_step);
                 }
             }
         }
+        
+        // --- End of Epoch Evaluation ---
+        
+        // 1. Evaluate on Training Set
+        std::pair<float, float> train_metrics = evaluate_model(train_X, train_Y, stem_conv, stem_ln, block1, downsample2, expand2, block2, downsample3, expand3, block3, downsample4, expand4, block4, gap, classifier);
+        float train_loss = train_metrics.first;
+        float train_acc = train_metrics.second;
 
-        // Epoch metrics
-        float avgLoss = totalLoss / X.size();
-        float avgAcc = 0;
-        for(size_t i=0;i<X.size();i++){
-            auto s = stem_conv.forward(X[i]);
-            s = stem_ln.forward(s);
-            s = block1.forward(s);
-            s = downsample2.forward(s);
-            s = expand2.forward(s);
-            s = block2.forward(s);
-            s = downsample3.forward(s);
-            s = expand3.forward(s);
-            s = block3.forward(s);
-            s = downsample4.forward(s);
-            s = expand4.forward(s);
-            s = block4.forward(s);
-            auto pred = classifier.forward(flatten(s), false);
-            avgAcc += multilabel_accuracy(pred,Y[i]);
-        }
-        avgAcc /= X.size();
-        cout << "Epoch " << e+1 << "/" << epochs << ": Loss = " << avgLoss << ", Accuracy = " << avgAcc << endl;
+        // 2. Evaluate on Validation Set
+        std::pair<float, float> val_metrics = evaluate_model(val_X, val_Y, stem_conv, stem_ln, block1, downsample2, expand2, block2, downsample3, expand3, block3, downsample4, expand4, block4, gap, classifier);
+        float val_loss = val_metrics.first;
+        float val_acc = val_metrics.second;
 
+        // --- Print Epoch Results ---
+        cout << "Epoch " << e+1 << "/" << epochs << ": LR = " << lr_epoch << " | Train Loss = " << train_loss 
+             << ", Train Acc = " << train_acc << " | Val Loss = " << val_loss << ", Val Acc = " << val_acc << endl;
+        
         if(freeze_base)
             cout << " [Incremental training: base frozen]" << endl;
-        else
-            cout << " [Full training: base trainable]" << endl;
+
+        // 3. Checkpointing
+        if (val_acc > best_val_acc) {
+            best_val_acc = val_acc;
+            cout << " *** New best validation accuracy: " << best_val_acc << ". Saving checkpoint: " << modelName << "_best.bin files ***" << endl;
+            save_all_weights(modelName + "_best", stem_conv, stem_ln, block1, expand2, block2, expand3, block3, expand4, block4, classifier);
+        }
     }
 
-    // --- Save Model ---
-    stem_conv.save(modelName + "_stem_conv");
-    stem_ln.save(modelName + "_stem_ln");
-    block1.save(modelName + "_block1");
-    expand2.save(modelName + "_expand2");
-    block2.save(modelName + "_block2");
-    expand3.save(modelName + "_expand3");
-    block3.save(modelName + "_block3");
-    expand4.save(modelName + "_expand4");
-    block4.save(modelName + "_block4");
-    classifier.save(modelName + "_fc");
-    save_tags(tag2idx, modelName);
+    // --- Save Final Model ---
+    cout << "Saving final model as " << modelName << "_final.bin files...\n";
+    save_all_weights(modelName + "_final", stem_conv, stem_ln, block1, expand2, block2, expand3, block3, expand4, block4, classifier);
 
-    cout << "Model training complete and saved to " << modelName << "_*.bin/json\n";
+    // --- After training loop ends ---
+    cout << "Saving tags...\n";
+    save_tags(tag2idx, modelName);
 
     return 0;
 }

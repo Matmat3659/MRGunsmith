@@ -2,6 +2,10 @@
 A ConvNeXt like trainer and runner in cpp
 THIS PROJECT IS UNDER DEVELOPMENT AND MAY CONTAIN BUGS
 
+Required
+  -  Eigen
+  -  crow_all.h specificly in this folder
+
 Compile guide
 
 for the trainer
@@ -97,4 +101,45 @@ for the runner is just
 ./runner path/to/image --model_folder path/to/where/the/model/is
 ```
 
-please give a star! i put a lot of time on this!
+server api
+input
+  -  single image
+  ```
+  {
+    "Model": "modlename",
+    "Image": "path/to/image",
+    "threshold" 0.0 to 1.0
+  }
+  ```
+  -  batch images
+  ```
+  {
+  	"Model": "modelname",
+  	"Image": ["pathtoimage1", "pathtoimage2", "pathtoimage3", ect],
+  	"threshold": 0.0 to 1.0
+  }
+  ```
+server commands
+```
+--config
+--port
+--address
+--threads
+```
+server --config structure
+```
+Modelfolder/path modelnickname modlebase(eg the model_best or model_final)
+Ex.
+MD19/SUBMD19 MD19 model_final
+```
+
+returns
+```
+{
+     "Image":"../1.jpg",
+     "Model":"MD19",
+     "Tags":["illustrated","anime","anime_girl"]
+}
+```
+
+please give a star! i put a lot of time and stupidity on this!

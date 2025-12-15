@@ -1,0 +1,1220 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <map>
+#include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>
+#include <random>
+#include <stdexcept>
+#include <omp.h>
+#include <tuple> // For std::tie in BCE
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "json.hpp"
+
+using json = nlohmann::json;
+using namespace std;
+
+// Define M_PI if not available
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---------------- Activation ----------------
+
+// ReLU (Rectified Linear Unit)
+inline float relu(float x) { return std::max(0.0f, x); }
+inline float relu_deriv(float x) { return x > 0.0f ? 1.0f : 0.0f; }
+
+// Softplus (smooth approximation of ReLU, used here as a proxy for GELU)
+inline float softplus(float x) { return std::log1p(std::exp(x)); }
+inline float softplus_deriv(float x) {
+    // derivative of softplus is sigmoid
+    if (x >= 0.0f) {
+        float z = std::exp(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = std::exp(x);
+        return z / (1.0f + z);
+    }
+}
+
+// Sigmoid (logistic) - used mainly for BCE output and Softplus derivative
+inline float sigmoid(float x) {
+    // Handle overflow prevention
+    if (x < -20.0f) return 1e-7f;
+    if (x > 20.0f) return 1.0f - 1e-7f;
+    return 1.0f / (1.0f + std::exp(-x));
+}
+inline float sigmoid_deriv(float x) {
+    float s = sigmoid(x);
+    return s * (1.0f - s);
+}
+
+// ====================== ACT ENUM =====================
+enum class Activation { RELU, SOFTPLUS, SIGMOID, IDENTITY };
+
+// ---------------- Xavier Initialization ----------------
+float xavier_init(int fan_in, int fan_out) {
+    // Simple He/Kaiming initialization approximation
+    thread_local std::mt19937 gen(std::random_device{}());
+    // For ReLU-like activations (SOFTPLUS is close enough)
+    float limit = std::sqrt(2.0f / fan_in);
+    std::uniform_real_distribution<float> dist(-limit, limit);
+    return dist(gen);
+}
+
+// ---------------- Flatten / Unflatten ----------------
+vector<float> flatten(const vector<vector<vector<float>>>& x){
+    vector<float> out;
+    for(const auto &f:x)
+        for(const auto &row:f)
+            for(float v:row)
+                out.push_back(v);
+    return out;
+}
+
+vector<vector<vector<float>>> unflatten(const vector<float>& flat, int F, int H, int W){
+    if(flat.size() != size_t(F*H*W)){
+        throw std::runtime_error("unflatten: flat vector size does not match target shape");
+    }
+
+    vector<vector<vector<float>>> out(F, vector<vector<float>>(H, vector<float>(W)));
+    int k = 0;
+    for(int f=0; f<F; f++)
+        for(int i=0; i<H; i++)
+            for(int j=0; j<W; j++)
+                out[f][i][j] = flat[k++];
+    return out;
+}
+
+// ---------------- Layer Normalization ----------------
+struct LayerNorm {
+    int channels;
+    std::vector<float> gamma; // Learnable scale
+    std::vector<float> beta;  // Learnable shift
+
+    // Cached values for backward pass
+    std::vector<float> lastInputFlat; // [C * H * W]
+    std::vector<float> lastMean;      // [C]
+    std::vector<float> lastInvStdDev; // [C]
+
+    LayerNorm(int C) : channels(C) {
+        gamma.resize(C, 1.0f); // Initialize scale to 1
+        beta.resize(C, 0.0f);  // Initialize shift to 0
+    }
+
+    // Input shape: [C][H][W]
+    // LayerNorm normalizes across the spatial dimensions (H, W) for each channel (C) independently.
+    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input) {
+        int H = input[0].size();
+        int W = input[0][0].size();
+        int N = H * W; // Elements per channel
+
+        // Flatten the input and resize caches
+        lastInputFlat.assign(channels * N, 0.0f);
+        lastMean.assign(channels, 0.0f);
+        lastInvStdDev.assign(channels, 0.0f);
+
+        std::vector<std::vector<std::vector<float>>> output(channels, std::vector<std::vector<float>>(H, std::vector<float>(W)));
+        const float epsilon = 1e-5f;
+
+        #pragma omp parallel for
+        for (int c = 0; c < channels; ++c) {
+            float mean = 0.0f;
+            // Calculate Mean
+            for (int i = 0; i < H; ++i) {
+                for (int j = 0; j < W; ++j) {
+                    float val = input[c][i][j];
+                    mean += val;
+                    lastInputFlat[c * N + i * W + j] = val;
+                }
+            }
+            mean /= N;
+            lastMean[c] = mean;
+
+            // Calculate Variance
+            float variance = 0.0f;
+            for (int i = 0; i < H; ++i) {
+                for (int j = 0; j < W; ++j) {
+                    float diff = input[c][i][j] - mean;
+                    variance += diff * diff;
+                }
+            }
+            variance /= N;
+
+            float invStdDev = 1.0f / std::sqrt(variance + epsilon);
+            lastInvStdDev[c] = invStdDev;
+
+            // Normalize and apply scale/shift
+            for (int i = 0; i < H; ++i) {
+                for (int j = 0; j < W; ++j) {
+                    float normalized = (input[c][i][j] - mean) * invStdDev;
+                    output[c][i][j] = gamma[c] * normalized + beta[c];
+                }
+            }
+        }
+        return output;
+    }
+
+    // dOut shape: [C][H][W]
+    // Returns dInput [C][H][W]
+    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, float lr) {
+        int H = dOut[0].size();
+        int W = dOut[0][0].size();
+        int N = H * W;
+        const float epsilon = 1e-5f;
+
+        std::vector<std::vector<std::vector<float>>> dInput(channels, std::vector<std::vector<float>>(H, std::vector<float>(W)));
+
+        #pragma omp parallel for
+        for (int c = 0; c < channels; ++c) {
+            float mean = lastMean[c];
+            float invStdDev = lastInvStdDev[c];
+
+            // 1. Calculate dGamma and dBeta
+            float dGamma = 0.0f;
+            float dBeta = 0.0f;
+
+            // dNormalized = dOut * gamma
+            std::vector<float> dNormalized(N);
+
+            for (int i = 0; i < H; ++i) {
+                for (int j = 0; j < W; ++j) {
+                    int flatIdx = c * N + i * W + j;
+                    float x_minus_mu = lastInputFlat[flatIdx] - mean;
+                    float normalized = x_minus_mu * invStdDev;
+
+                    float grad_out = dOut[c][i][j];
+                    dGamma += grad_out * normalized;
+                    dBeta += grad_out;
+
+                    dNormalized[i * W + j] = grad_out * gamma[c];
+                }
+            }
+
+            // Update gamma and beta
+            gamma[c] -= lr * dGamma;
+            beta[c] -= lr * dBeta;
+
+            // 2. Calculate dInput (dL/dX)
+            float term1_sum = 0.0f;
+            float term2_sum = 0.0f;
+
+            for (int i = 0; i < H; ++i) {
+                for (int j = 0; j < W; ++j) {
+                    int flatIdx = c * N + i * W + j;
+                    float x_minus_mu = lastInputFlat[flatIdx] - mean;
+                    float dN = dNormalized[i * W + j];
+
+                    term1_sum += dN * x_minus_mu;
+                    term2_sum += dN;
+                }
+            }
+
+            float invN = 1.0f / N;
+            float invN_stddev_pow3 = invN * invStdDev * invStdDev * invStdDev;
+
+            for (int i = 0; i < H; ++i) {
+                for (int j = 0; j < W; ++j) {
+                    int flatIdx = c * N + i * W + j;
+                    float x_minus_mu = lastInputFlat[flatIdx] - mean;
+                    float dN = dNormalized[i * W + j];
+
+                    float dX_i = dN * invStdDev;
+                    dX_i -= x_minus_mu * term1_sum * invN_stddev_pow3;
+                    dX_i -= term2_sum * invStdDev * invN;
+
+                    dInput[c][i][j] = dX_i;
+                }
+            }
+        }
+        return dInput;
+    }
+
+    void save(const std::string& prefix){
+        std::ofstream gfile(prefix + "_gamma.bin", std::ios::binary);
+        gfile.write(reinterpret_cast<char*>(gamma.data()), gamma.size()*sizeof(float));
+        gfile.close();
+
+        std::ofstream bfile(prefix + "_beta.bin", std::ios::binary);
+        bfile.write(reinterpret_cast<char*>(beta.data()), beta.size()*sizeof(float));
+        bfile.close();
+    }
+
+    void load(const std::string& prefix){
+        std::ifstream gfile(prefix + "_gamma.bin", std::ios::binary);
+        gfile.read(reinterpret_cast<char*>(gamma.data()), gamma.size()*sizeof(float));
+        gfile.close();
+
+        std::ifstream bfile(prefix + "_beta.bin", std::ios::binary);
+        bfile.read(reinterpret_cast<char*>(beta.data()), beta.size()*sizeof(float));
+        bfile.close();
+    }
+};
+
+// ---------------- Convolution Layer (Modified to support Depthwise) ----------------
+struct ConvLayer {
+    int kernelSize, numFilters, stride, padding;
+    Activation act;
+    int inChannels;
+    int groups; // groups=inChannels means Depthwise Conv
+
+    std::vector<std::vector<std::vector<std::vector<float>>>> kernels;
+    std::vector<float> biases;
+
+    std::vector<std::vector<std::vector<float>>> lastInput;
+    std::vector<std::vector<std::vector<float>>> lastPreActivation;
+
+    ConvLayer(int inChannels_, int kernelSize_, int numFilters_, Activation act_ = Activation::RELU,
+              int stride_ = 1, int padding_ = 0, int groups_ = 1)
+        : inChannels(inChannels_), kernelSize(kernelSize_), numFilters(numFilters_), act(act_),
+          stride(stride_), padding(padding_), groups(groups_)
+    {
+        if (inChannels % groups != 0 || numFilters % groups != 0) {
+            throw std::invalid_argument("InChannels and NumFilters must be divisible by groups.");
+        }
+        int channels_per_group = inChannels / groups;
+
+        // Kernels shape: [numFilters][channels_per_group][kernelSize][kernelSize]
+        kernels.resize(numFilters, std::vector<std::vector<std::vector<float>>>(
+            channels_per_group,
+            std::vector<std::vector<float>>(kernelSize, std::vector<float>(kernelSize))));
+
+        biases.resize(numFilters, 0.0f);
+
+        // Initialize weights
+        #pragma omp parallel for collapse(4)
+        for(int f=0; f<numFilters; f++)
+            for(int c=0; c<channels_per_group; c++)
+                for(int i=0; i<kernelSize; i++)
+                    for(int j=0; j<kernelSize; j++)
+                        kernels[f][c][i][j] = xavier_init(kernelSize*kernelSize*channels_per_group, numFilters/groups);
+    }
+
+    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input) {
+        lastInput = input;
+        int n = input[0].size();
+        int outSize = (n + 2*padding - kernelSize) / stride + 1;
+
+        lastPreActivation.assign(numFilters, std::vector<std::vector<float>>(outSize, std::vector<float>(outSize, 0.0f)));
+        std::vector<std::vector<std::vector<float>>> out(numFilters, std::vector<std::vector<float>>(outSize, std::vector<float>(outSize, 0.0f)));
+
+        int channels_per_group = inChannels / groups;
+        int filters_per_group = numFilters / groups;
+
+        #pragma omp parallel for collapse(3)
+        for(int f=0; f<numFilters; f++){
+            int group_idx = f / filters_per_group;
+
+            for(int i=0; i<outSize; i++){
+                for(int j=0; j<outSize; j++){
+                    float sum = 0.0f;
+
+                    for(int c_in_g=0; c_in_g<channels_per_group; c_in_g++){
+                        int c_in = group_idx * channels_per_group + c_in_g;
+
+                        for(int ki=0; ki<kernelSize; ki++)
+                            for(int kj=0; kj<kernelSize; kj++){
+                                int in_i = i*stride + ki - padding;
+                                int in_j = j*stride + kj - padding;
+                                float val = (in_i>=0 && in_i<n && in_j>=0 && in_j<n) ? input[c_in][in_i][in_j] : 0.0f;
+                                sum += val * kernels[f][c_in_g][ki][kj];
+                            }
+                    }
+
+                    sum += biases[f];
+                    lastPreActivation[f][i][j] = sum;
+
+                    // Activation
+                    switch(act){
+                        case Activation::RELU: out[f][i][j] = relu(sum); break;
+                        case Activation::SOFTPLUS: out[f][i][j] = softplus(sum); break;
+                        case Activation::SIGMOID: out[f][i][j] = sigmoid(sum); break;
+                        case Activation::IDENTITY: out[f][i][j] = sum; break;
+                    }
+                }
+            }
+        }
+
+        return out;
+    }
+
+    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, float lr){
+        int n = lastInput[0].size();
+        int outSize = dOut[0].size();
+        std::vector<std::vector<std::vector<float>>> dInput(inChannels, std::vector<std::vector<float>>(n, std::vector<float>(n,0.0f)));
+
+        int channels_per_group = inChannels / groups;
+        int filters_per_group = numFilters / groups;
+
+        #pragma omp parallel for
+        for(int f=0; f<numFilters; f++){
+            int group_idx = f / filters_per_group;
+
+            for(int i=0; i<outSize; i++){
+                for(int j=0; j<outSize; j++){
+                    float grad = 0.0f;
+                    float z = lastPreActivation[f][i][j];
+
+                    // Apply derivative of activation
+                    switch(act){
+                        case Activation::RELU: grad = dOut[f][i][j]*relu_deriv(z); break;
+                        case Activation::SOFTPLUS: grad = dOut[f][i][j]*softplus_deriv(z); break;
+                        case Activation::SIGMOID: grad = dOut[f][i][j]*sigmoid_deriv(z); break;
+                        case Activation::IDENTITY: grad = dOut[f][i][j]; break; // Derivative of f(x)=x is 1
+                    }
+
+                    biases[f] -= lr*grad;
+
+                    for(int c_in_g=0; c_in_g<channels_per_group; c_in_g++){
+                        int c_in = group_idx * channels_per_group + c_in_g;
+
+                        for(int ki=0; ki<kernelSize; ki++)
+                            for(int kj=0; kj<kernelSize; kj++){
+                                int in_i = i*stride + ki - padding;
+                                int in_j = j*stride + kj - padding;
+                                if(in_i>=0 && in_i<n && in_j>=0 && in_j<n){
+                                    // Gradient w.r.t input (dInput)
+                                    #pragma omp atomic
+                                    dInput[c_in][in_i][in_j] += grad * kernels[f][c_in_g][ki][kj];
+
+                                    // Gradient w.r.t weight (kernel update)
+                                    kernels[f][c_in_g][ki][kj] -= lr*grad*lastInput[c_in][in_i][in_j];
+                                }
+                            }
+                    }
+                }
+            }
+        }
+
+        return dInput;
+    }
+
+    void save(std::string prefix){
+        std::ofstream kfile(prefix + "_kernels.bin", std::ios::binary);
+        for(auto &f:kernels)
+            for(auto &c:f)
+                for(auto &row:c)
+                    kfile.write(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
+        kfile.close();
+
+        std::ofstream bfile(prefix + "_bias.bin", std::ios::binary);
+        bfile.write(reinterpret_cast<char*>(biases.data()), biases.size()*sizeof(float));
+        bfile.close();
+    }
+
+    void load(std::string prefix){
+        std::ifstream kfile(prefix + "_kernels.bin", std::ios::binary);
+        for(auto &f:kernels)
+            for(auto &c:f)
+                for(auto &row:c)
+                    kfile.read(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
+        kfile.close();
+
+        std::ifstream bfile(prefix + "_bias.bin", std::ios::binary);
+        bfile.read(reinterpret_cast<char*>(biases.data()), biases.size()*sizeof(float));
+        bfile.close();
+    }
+};
+
+// ---------------- ConvNeXt Block ----------------
+// Represents the core ConvNeXt inverted bottleneck block
+struct ConvNeXtBlock {
+    int channels;
+    // 1. Depthwise Conv 7x7 (large kernel)
+    ConvLayer dwConv;
+    // 2. Layer Norm
+    LayerNorm ln;
+    // 3. 1x1 Pointwise Expansion (ratio 4, Softplus/GELU)
+    ConvLayer pwConv1;
+    // 4. 1x1 Pointwise Projection (back to C channels, Identity)
+    ConvLayer pwConv2;
+
+    ConvNeXtBlock(int C, int expansion_ratio = 4)
+        : channels(C),
+        // 1. Depthwise Conv: 7x7, groups=C (Depthwise), padding=3 (to keep size).
+        dwConv(C, 7, C, Activation::IDENTITY, 1, 3, C),
+        // 2. LayerNorm: applied to the output of DW Conv
+        ln(C),
+        // 3. 1x1 Expansion: C in, 4*C out. SOFTPLUS (proxy for GELU) activation.
+        pwConv1(C, 1, C * expansion_ratio, Activation::SOFTPLUS, 1, 0, 1),
+        // 4. 1x1 Projection: 4*C in, C out. MUST be IDENTITY (no activation).
+        pwConv2(C * expansion_ratio, 1, C, Activation::IDENTITY, 1, 0, 1)
+    {}
+
+    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input) {
+        // Residual Connection (Identity)
+        std::vector<std::vector<std::vector<float>>> residual = input;
+
+        // 1. Depthwise Conv 7x7
+        std::vector<std::vector<std::vector<float>>> x = dwConv.forward(input);
+
+        // 2. Layer Normalization
+        x = ln.forward(x);
+
+        // 3. 1x1 Pointwise Expansion (Softplus/GELU)
+        x = pwConv1.forward(x);
+
+        // 4. 1x1 Pointwise Projection (Linear/Identity)
+        x = pwConv2.forward(x);
+
+        // 5. Add Residual (x + residual)
+        int C = x.size();
+        int H = x[0].size();
+        int W = x[0][0].size();
+
+        #pragma omp parallel for collapse(3)
+        for(int c=0; c<C; c++)
+            for(int i=0; i<H; i++)
+                for(int j=0; j<W; j++)
+                    x[c][i][j] += residual[c][i][j];
+
+        return x;
+    }
+
+    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut, float lr) {
+
+        std::vector<std::vector<std::vector<float>>> dResidual = dOut;
+        std::vector<std::vector<std::vector<float>>> dBlock = dOut;
+
+        // 1. Backprop 1x1 Projection (pwConv2)
+        dBlock = pwConv2.backward(dBlock, lr);
+
+        // 2. Backprop 1x1 Expansion (pwConv1)
+        dBlock = pwConv1.backward(dBlock, lr);
+
+        // 3. Backprop Layer Norm
+        dBlock = ln.backward(dBlock, lr);
+
+        // 4. Backprop Depthwise Conv (dwConv)
+        dBlock = dwConv.backward(dBlock, lr);
+
+        // 5. Combine with residual gradient (dBlock + dResidual)
+        int C = dBlock.size();
+        int H = dBlock[0].size();
+        int W = dBlock[0][0].size();
+
+        #pragma omp parallel for collapse(3)
+        for(int c=0; c<C; c++)
+            for(int i=0; i<H; i++)
+                for(int j=0; j<W; j++)
+                    dBlock[c][i][j] += dResidual[c][i][j];
+
+        return dBlock;
+    }
+
+    void save(const std::string& prefix) {
+        dwConv.save(prefix + "_dw");
+        ln.save(prefix + "_ln");
+        pwConv1.save(prefix + "_pw1");
+        pwConv2.save(prefix + "_pw2");
+    }
+
+    void load(const std::string& prefix) {
+        dwConv.load(prefix + "_dw");
+        ln.load(prefix + "_ln");
+        pwConv1.load(prefix + "_pw1");
+        pwConv2.load(prefix + "_pw2");
+    }
+};
+
+// ---------------- MaxPool Layer (kept for downsampling) ----------------
+struct MaxPool {
+    int poolSize;
+    int stride;
+    int padding;
+    // Stores the (i, j) coordinates of the maximum value for each output cell
+    std::vector<std::vector<std::vector<std::pair<int,int>>>> maxPos;
+    // FIX: Cache the original input dimensions for the backward pass
+    int lastH;
+    int lastW;
+
+    MaxPool(int poolSize_ = 2, int stride_ = 2, int padding_ = 0)
+        : poolSize(poolSize_), stride(stride_), padding(padding_), lastH(0), lastW(0) {}
+
+    std::vector<std::vector<std::vector<float>>> forward(const std::vector<std::vector<std::vector<float>>>& input)
+    {
+        int F = input.size();
+        int H = input[0].size();
+        int W = input[0][0].size();
+        // FIX: Store input dimensions
+        lastH = H;
+        lastW = W;
+
+        int outH = (H + 2*padding - poolSize) / stride + 1;
+        int outW = (W + 2*padding - poolSize) / stride + 1;
+
+        maxPos.resize(F, std::vector<std::vector<std::pair<int,int>>>(outH, std::vector<std::pair<int,int>>(outW)));
+
+        std::vector<std::vector<std::vector<float>>> out(
+            F, std::vector<std::vector<float>>(outH, std::vector<float>(outW, 0)));
+
+        #pragma omp parallel for
+        for(int f = 0; f < F; f++){
+            for(int i = 0; i < outH; i++){
+                for(int j = 0; j < outW; j++){
+                    float m = -1e30f; // Very small number
+                    int max_i = -1, max_j = -1;
+                    for(int pi = 0; pi < poolSize; pi++){
+                        for(int pj = 0; pj < poolSize; pj++){
+                            int in_i = i*stride + pi - padding;
+                            int in_j = j*stride + pj - padding;
+                            float val = (in_i >= 0 && in_i < H && in_j >= 0 && in_j < W) ? input[f][in_i][in_j] : -1e30f;
+                            if(val > m){ m = val; max_i = in_i; max_j = in_j; }
+                        }
+                    }
+                    out[f][i][j] = m;
+                    maxPos[f][i][j] = {max_i, max_j};
+                }
+            }
+        }
+
+        return out;
+    }
+
+    // FIX: Removed origH, origW arguments and using cached lastH, lastW instead.
+    std::vector<std::vector<std::vector<float>>> backward(const std::vector<std::vector<std::vector<float>>>& dOut)
+    {
+        int F = dOut.size();
+        // Use cached dimensions
+        int origH = lastH;
+        int origW = lastW;
+
+        std::vector<std::vector<std::vector<float>>> dInput(
+            F, std::vector<std::vector<float>>(origH, std::vector<float>(origW, 0)));
+
+        #pragma omp parallel for
+        for(int f = 0; f < F; f++){
+            for(size_t i = 0; i < dOut[0].size(); i++){ // outH
+                for(size_t j = 0; j < dOut[0][0].size(); j++){ // outW
+                    // Use std::tie to extract the coordinates
+                    int pi, pj;
+                    std::tie(pi, pj) = maxPos[f][i][j];
+                    // Bounds check is technically only needed if maxPos could be outside origH/origW, but good practice
+                    if(pi >= 0 && pj >= 0 && pi < origH && pj < origW)
+                        dInput[f][pi][pj] = dOut[f][i][j];
+                }
+            }
+        }
+
+        return dInput;
+    }
+};
+
+// ---------------- Fully Connected Layer (kept for classification head) ----------------
+struct FCLayer {
+    int inSize, outSize;
+    std::vector<std::vector<float>> W;
+    std::vector<float> B;
+    std::vector<float> lastIn;
+    std::vector<float> lastPreActivation; // To store z = Wx + b
+    Activation act;
+    float dropoutProb;
+    std::vector<bool> dropoutMask;
+
+    FCLayer(int inS, int outS, Activation act_ = Activation::SIGMOID, float dropout_=0.0f)
+        : inSize(inS), outSize(outS), act(act_), dropoutProb(dropout_)
+    {
+        W.resize(outSize, std::vector<float>(inSize));
+        B.resize(outSize, 0.0f);
+        for(int i=0; i<outSize; i++)
+            for(int j=0; j<inSize; j++)
+                W[i][j] = xavier_init(inS, outS);
+    }
+
+    std::vector<float> forward(const std::vector<float>& in, bool training=true){
+        lastIn = in;
+        lastPreActivation.resize(outSize);
+        std::vector<float> out(outSize);
+        dropoutMask.clear();
+        dropoutMask.resize(outSize, true);
+
+        for(int i=0; i<outSize; i++){
+            float s = 0;
+            for(int j=0; j<inSize; j++)
+                s += W[i][j] * in[j];
+            s += B[i];
+            lastPreActivation[i] = s;
+
+            // Activation
+            switch(act){
+                case Activation::RELU: out[i] = relu(s); break;
+                case Activation::SOFTPLUS: out[i] = softplus(s); break;
+                case Activation::SIGMOID: out[i] = sigmoid(s); break;
+                case Activation::IDENTITY: out[i] = s; break;
+            }
+
+            // Apply dropout if training
+            if(training && dropoutProb > 0.0f){
+                // Using rand() for simplicity. Scale is 1/(1-p).
+                float scale = 1.0f / (1.0f - dropoutProb);
+                float r = ((float)rand() / (float)RAND_MAX);
+                if(r < dropoutProb){
+                    out[i] = 0;
+                    dropoutMask[i] = false;
+                } else {
+                    out[i] *= scale; // Apply scaling to compensate for dropped units
+                }
+            }
+        }
+        return out;
+    }
+
+    std::vector<float> backward(const std::vector<float>& grad, float lr){
+        std::vector<float> dInput(inSize,0);
+
+        // Calculate dL/dW and dL/dB (updates) and dL/dX (dInput)
+        for(int i=0; i<outSize; i++){
+            float g = grad[i];
+
+            // Reapply dropout mask and scaling from forward pass
+            if(!dropoutMask[i]) {
+                g = 0.0f;
+            } else if (dropoutProb > 0.0f) {
+                float scale = 1.0f / (1.0f - dropoutProb);
+                g *= scale;
+            }
+
+
+            // Apply derivative of activation if NOT using BCE_grad with SIGMOID
+            float z = lastPreActivation[i];
+
+            switch(act){
+                case Activation::RELU: g *= relu_deriv(z); break;
+                case Activation::SOFTPLUS: g *= softplus_deriv(z); break;
+                case Activation::IDENTITY: g *= 1.0f; break;
+                // BCE_grad already calculates dL/dz = p-t, so no further activation derivative is needed for SIGMOID.
+                case Activation::SIGMOID: break;
+            }
+
+            for(int j=0; j<inSize; j++){
+                dInput[j] += g * W[i][j];
+                W[i][j] -= lr * g * lastIn[j]; // Update weights
+            }
+            B[i] -= lr * g; // Update bias
+        }
+
+        return dInput;
+    }
+    
+    void expandOutputs(int newOutSize) {
+        if(newOutSize <= outSize) return;
+    
+        std::vector<std::vector<float>> newW(newOutSize, std::vector<float>(inSize));
+        std::vector<float> newB(newOutSize, 0.0f);
+        
+        for(int i=0;i<outSize;i++){
+            for(int j=0;j<inSize;j++)
+                newW[i][j] = W[i][j];
+            newB[i] = B[i];
+        }
+        
+        for(int i=outSize;i<newOutSize;i++){
+            for(int j=0;j<inSize;j++)
+                newW[i][j] = xavier_init(inSize, newOutSize);
+            newB[i] = 0.0f;
+        }
+    
+        W = std::move(newW);
+        B = std::move(newB);
+        outSize = newOutSize;
+    
+        std::cout << "FC layer expanded to " << outSize << " outputs.\n";
+    }
+    
+    void save(const std::string& prefix){
+        std::ofstream wfile(prefix + "_weights.bin", std::ios::binary);
+        for(auto &row: W)
+            wfile.write(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
+        wfile.close();
+
+        std::ofstream bfile(prefix + "_bias.bin", std::ios::binary);
+        bfile.write(reinterpret_cast<char*>(B.data()), B.size()*sizeof(float));
+        bfile.close();
+    }
+
+    void load(const std::string& prefix){
+        std::ifstream wfile(prefix + "_weights.bin", std::ios::binary);
+        for(auto &row: W)
+            wfile.read(reinterpret_cast<char*>(row.data()), row.size()*sizeof(float));
+        wfile.close();
+
+        std::ifstream bfile(prefix + "_bias.bin", std::ios::binary);
+        bfile.read(reinterpret_cast<char*>(B.data()), B.size()*sizeof(float));
+        bfile.close();
+    }
+};
+
+// ---------------- Helper Functions ----------------
+vector<float> BCE_grad(const vector<float>& p, const vector<float>& t){
+    vector<float> g(p.size());
+    for(size_t i=0;i<p.size();i++){
+        float pi = std::clamp(p[i], 1e-7f, 1.0f-1e-7f);
+        g[i] = pi - t[i];
+    }
+    return g;
+}
+
+void save_tags(const map<string,int>& tag2idx, const string& prefix){
+    json j;
+    for(auto &p: tag2idx) j[p.first] = p.second;
+    ofstream f(prefix + "_tags.json");
+    f << j.dump(4);
+    f.close();
+}
+
+void load_tags(map<string,int>& tag2idx, const string& prefix){
+    ifstream f(prefix + "_tags.json");
+    if(!f.is_open()){ cerr << "Cannot open tag file\n"; return; }
+    json j; f >> j;
+    tag2idx.clear();
+    for(auto &item: j.items()){
+        tag2idx[item.key()] = item.value();
+    }
+    f.close();
+}
+
+
+vector<vector<vector<float>>> load_image_resized(string path, int targetSize){
+    int w, h, c;
+    unsigned char* img = stbi_load(path.c_str(), &w, &h, &c, 3);
+    if(!img){ cerr << "Failed to load " << path << endl; exit(1); }
+    
+    vector<vector<vector<float>>> out(3, vector<vector<float>>(targetSize, vector<float>(targetSize, 0)));
+    const float inv255 = 1.0f / 255.0f;
+    
+    for(int i=0; i<targetSize; i++){
+        float fx = i * (h-1.0f)/(targetSize-1.0f); int x0 = (int)fx, x1 = min(x0+1, h-1); float dx = fx - x0;
+        for(int j=0; j<targetSize; j++){
+            float fy = j * (w-1.0f)/(targetSize-1.0f); int y0 = (int)fy, y1 = min(y0+1, w-1); float dy = fy - y0;
+
+            for(int ch=0; ch<3; ch++){
+                float v00 = img[(x0*w + y0)*3 + ch]*inv255;
+                float v01 = img[(x0*w + y1)*3 + ch]*inv255;
+                float v10 = img[(x1*w + y0)*3 + ch]*inv255;
+                float v11 = img[(x1*w + y1)*3 + ch]*inv255;
+                
+                out[ch][i][j] = (1-dx)*(1-dy)*v00 + (1-dx)*dy*v01 + dx*(1-dy)*v10 + dx*dy*v11;
+            }
+        }
+    }
+    
+    for(int ch=0; ch<3; ch++)
+        for(int i=0; i<targetSize; i++)
+            for(int j=0; j<targetSize; j++)
+                out[ch][i][j] = (out[ch][i][j] - 0.5f) / 0.5f;
+
+    stbi_image_free(img);
+    return out;
+}
+
+using Image = vector<vector<vector<float>>>;
+
+// ---------------- Compose augmentation ---------------- //
+Image augment_image(const Image& img) {
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+
+    Image out = img;
+    int C = img.size();
+    int H = img[0].size();
+    int W = img[0][0].size();
+    
+    if (C != 3) { /* Handle error or different channel count if needed */ }
+
+    // ---- Horizontal Flip ----
+    if (uniform(rng) < 0.5f) {
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W / 2; w++)
+                    std::swap(out[c][h][w], out[c][h][W - 1 - w]);
+    }
+
+    // ---- Rotate 90 degrees clockwise ----
+    if (uniform(rng) < 0.5f) {
+        Image rotated(C, vector<vector<float>>(W, vector<float>(H)));
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++)
+                    rotated[c][w][H - 1 - h] = out[c][h][w];
+        out = std::move(rotated);
+        std::swap(H, W); // Update height and width after rotation
+    }
+
+    // ---- Color jitter (brightness + contrast) ----
+    float brightness = 0.2f;
+    float contrast = 0.2f;
+    float b = (uniform(rng) * 2 - 1) * brightness; // [-brightness, brightness]
+    float c = 1.0f + (uniform(rng) * 2 - 1) * contrast; // [1-contrast, 1+contrast]
+
+    for (int ch = 0; ch < C; ch++)
+        for (int h = 0; h < H; h++)
+            for (int w = 0; w < W; w++) {
+                float val = out[ch][h][w] * c + b;
+                out[ch][h][w] = std::min(std::max(val, -1.0f), 1.0f); 
+            }
+
+    return out;
+}
+
+void load_dataset(const string& folder,
+                  vector<vector<vector<vector<float>>>>& X,
+                  vector<vector<float>>& Y,
+                  map<string,int>& tag2idx,
+                  int targetSize)
+{
+    ifstream tfile(folder + "/tags.json");
+    if(!tfile.is_open()){ cerr<<"Cannot open tags.json\n"; exit(1);}
+    json j; tfile >> j;
+
+    int numTags = 0;
+    for(auto &f:j.items())
+        for(auto &img:f.value().items())
+            for(auto &tag:img.value())
+                if(tag2idx.find(tag) == tag2idx.end())
+                    tag2idx[tag] = numTags++;
+
+    for(auto &f:j.items())
+        for(auto &img:f.value().items()){
+            string path = folder + "/" + f.key() + "/" + img.key();
+            // Use the renamed/updated image loading function
+            auto imgRGB = load_image_resized(path, targetSize);
+            // Augment image after resizing
+            imgRGB = augment_image(imgRGB);
+            X.push_back(imgRGB);
+
+            vector<float> multi(tag2idx.size(), 0.0f);
+            for(auto &tag: img.value())
+                multi[tag2idx[tag]] = 1.0f;
+            Y.push_back(multi);
+        }
+}
+
+struct Dataset {
+    vector<vector<vector<vector<float>>>> X; // [N][C][H][W]
+    vector<vector<float>> Y;                 // [N][num_labels]
+    int N, C, H, W, num_labels;
+};
+
+Dataset load_dataset_bin(const string& folder_path, map<string,int>& tag2idx) {
+    Dataset data;
+
+    // Tags file
+    string tag_file = folder_path + "/tags.json";
+    ifstream ftag(tag_file);
+    if(!ftag.is_open()){
+        cerr << "Cannot open tag file " << tag_file << "\n"; 
+        exit(1);
+    }
+
+    json j; 
+    ftag >> j;
+    tag2idx.clear();
+    for(auto &item: j.items()) 
+        tag2idx[item.key()] = item.value();
+    ftag.close();
+
+    // Dataset file
+    string bin_path = folder_path + "/dataset.bin";
+    ifstream fin(bin_path, ios::binary);
+    if(!fin.is_open()){ 
+        cerr << "Cannot open dataset file " << bin_path << "\n"; 
+        exit(1); 
+    }
+
+    // Read header
+    fin.read((char*)&data.N, sizeof(int));
+    fin.read((char*)&data.C, sizeof(int));
+    fin.read((char*)&data.H, sizeof(int));
+    fin.read((char*)&data.W, sizeof(int));
+    fin.read((char*)&data.num_labels, sizeof(int));
+
+    data.X.resize(data.N, vector<vector<vector<float>>>(data.C, vector<vector<float>>(data.H, vector<float>(data.W))));
+    data.Y.resize(data.N, vector<float>(data.num_labels));
+
+    for(int i=0;i<data.N;i++){
+        for(int c=0;c<data.C;c++)
+            for(int h=0;h<data.H;h++)
+                for(int w=0;w<data.W;w++)
+                    fin.read((char*)&data.X[i][c][h][w], sizeof(float));
+
+        for(int l=0;l<data.num_labels;l++)
+            fin.read((char*)&data.Y[i][l], sizeof(float));
+    }
+
+    fin.close();
+    cout << "Loaded " << data.N << " images of size " 
+         << data.C << "x" << data.H << "x" << data.W 
+         << " with " << data.num_labels << " labels.\n";
+
+    return data;
+}
+
+float multilabel_accuracy(const vector<float>& pred, const vector<float>& target, float threshold=0.5f){
+    int correct=0, total=0;
+    for(size_t i=0; i<pred.size(); i++){
+        bool p = pred[i] > threshold;
+        bool t = target[i] > 0.5f;
+        if(p==t) correct++;
+        total++;
+    }
+    return correct/(float)total;
+}
+
+// ---------------- MAIN ----------------
+int main(int argc,char **argv){
+    // Seed RNGs
+    srand(time(0));
+    random_device rd; mt19937 g(rd());
+
+    vector<vector<vector<vector<float>>>> X; // Dataset images
+    vector<vector<float>> Y;                 // Dataset labels
+    map<string,int> tag2idx;                 // Tag name to index
+
+    string dataFolder = "Data";
+    string loadModelFolder = "";
+    bool freeze_base = false;
+    int epochs = 50;
+    float lr = 0.005f;
+    int batchSize = 2;
+    int numThreads = 4;
+    int imageSize = 128;
+
+    // Command line arguments
+    for(int i=1;i<argc;i++){
+        string arg=argv[i];
+        if(arg=="--data" && i+1<argc){ dataFolder = argv[i+1]; i++; }
+        else if(arg=="--epochs" && i+1<argc){ epochs = stoi(argv[i+1]); i++; }
+        else if(arg=="--lr" && i+1<argc){ lr = stof(argv[i+1]); i++; }
+        else if(arg=="--batch" && i+1<argc){ batchSize = stoi(argv[i+1]); i++; }
+        else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
+        else if(arg=="--load-model" && i+1<argc){ loadModelFolder = argv[i+1]; i++; }
+        else if(arg=="--size" && i+1<argc){ imageSize = stoi(argv[i+1]); i++; }
+    }
+
+    omp_set_num_threads(numThreads);
+    cout << "Using " << numThreads << " OpenMP threads\n";
+    cout << "Batch size set to: " << batchSize << endl;
+
+    // ---------------- Load dataset ----------------
+    cout << "Loading dataset from folder: " << dataFolder << "\n";
+    Dataset data = load_dataset_bin(dataFolder, tag2idx);
+    X = std::move(data.X);
+    Y = std::move(data.Y);
+    imageSize = data.H;
+
+    // ---------------- Check data ----------------
+    if (X.empty()) {
+        cerr << "Error: No data loaded. Exiting.\n";
+        return 1;
+    }
+
+    // --- ConvNeXt Base-like Architecture ---
+    const int C1 = 64;
+    const int C2 = 128;
+    const int C3 = 256;
+    const int C4 = 512;
+
+    ConvLayer stem_conv(3, 4, C1, Activation::IDENTITY, 4, 0, 1);
+    LayerNorm stem_ln(C1);
+    ConvNeXtBlock block1(C1);
+
+    MaxPool downsample2(2, 2);
+    ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1);
+    ConvNeXtBlock block2(C2);
+
+    MaxPool downsample3(2, 2);
+    ConvLayer expand3(C2, 1, C3, Activation::IDENTITY, 1, 0, 1);
+    ConvNeXtBlock block3(C3);
+
+    MaxPool downsample4(2, 2);
+    ConvLayer expand4(C3, 1, C4, Activation::IDENTITY, 1, 0, 1);
+    ConvNeXtBlock block4(C4);
+
+    // Dry run to compute FC input size
+    int fcInputSize = 0;
+    int feature_H=0, feature_W=0;
+    {
+        auto s = stem_conv.forward(X[0]);
+        s = stem_ln.forward(s);
+        s = block1.forward(s);
+        s = downsample2.forward(s);
+        s = expand2.forward(s);
+        s = block2.forward(s);
+        s = downsample3.forward(s);
+        s = expand3.forward(s);
+        s = block3.forward(s);
+        s = downsample4.forward(s);
+        s = expand4.forward(s);
+        s = block4.forward(s);
+
+        feature_H = s[0].size();
+        feature_W = s[0][0].size();
+        fcInputSize = s.size() * feature_H * feature_W;
+    }
+
+    FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID);
+    string modelName = "convnext_base";
+
+    // --- Load model for incremental training if folder specified ---
+    if(!loadModelFolder.empty()) {
+        cout << "Loading model from folder: " << loadModelFolder << "\n";
+    
+        // Load ConvNeXt base layers
+        stem_conv.load(loadModelFolder + "/stem_conv");
+        stem_ln.load(loadModelFolder + "/stem_ln");
+        block1.load(loadModelFolder + "/block1");
+        expand2.load(loadModelFolder + "/expand2");
+        block2.load(loadModelFolder + "/block2");
+        expand3.load(loadModelFolder + "/expand3");
+        block3.load(loadModelFolder + "/block3");
+        expand4.load(loadModelFolder + "/expand4");
+        block4.load(loadModelFolder + "/block4");
+        classifier.load(loadModelFolder + "/fc");
+        
+        map<string,int> oldTags;
+        load_tags(oldTags, loadModelFolder + "/" + modelName);
+    
+        for(auto &p : oldTags){
+            if(tag2idx.find(p.first) == tag2idx.end()){
+                tag2idx[p.first] = tag2idx.size();
+            }
+        }
+    
+        freeze_base = true;
+    }
+    
+    int oldFCsize = classifier.outSize;
+    int newFCsize = tag2idx.size();
+    if(newFCsize > oldFCsize){
+        classifier.expandOutputs(newFCsize);
+    }
+    
+    cout << "Network initialized. Output feature map: " << C4 << "x" << feature_H << "x" << feature_W << "\n";
+    cout << "Input size to FC: " << fcInputSize << " (C=" << C4 << ")\n";
+
+    // ---------------- Training loop ----------------
+    for(int e=0; e<epochs; e++){
+        float totalLoss = 0;
+
+        // Shuffle indices
+        vector<int> indices(X.size());
+        iota(indices.begin(), indices.end(), 0);
+        shuffle(indices.begin(), indices.end(), g);
+
+        for(size_t i=0;i<X.size();i+=batchSize){
+            vector<vector<vector<vector<float>>>> batch_inputs;
+            vector<vector<float>> batch_targets;
+            vector<vector<float>> batch_preds;
+            vector<vector<float>> all_dInput_fc;
+
+            int currentBatchSize = 0;
+            for(int b=0;b<batchSize && i+b<X.size();b++){
+                int idx = indices[i+b];
+                batch_inputs.push_back(X[idx]);
+                batch_targets.push_back(Y[idx]);
+                currentBatchSize++;
+            }
+
+            // Forward pass
+            for(int b=0;b<currentBatchSize;b++){
+                auto s = stem_conv.forward(batch_inputs[b]);
+                s = stem_ln.forward(s);
+                s = block1.forward(s);
+                s = downsample2.forward(s);
+                s = expand2.forward(s);
+                s = block2.forward(s);
+                s = downsample3.forward(s);
+                s = expand3.forward(s);
+                s = block3.forward(s);
+                s = downsample4.forward(s);
+                s = expand4.forward(s);
+                s = block4.forward(s);
+
+                auto flat = flatten(s);
+                auto pred = classifier.forward(flat);
+                batch_preds.push_back(pred);
+
+                auto grad_fc = BCE_grad(pred, batch_targets[b]);
+                for(size_t k=0;k<pred.size();k++){
+                    float p_k = std::clamp(pred[k], 1e-7f, 1.0f-1e-7f);
+                    totalLoss += batch_targets[b][k] > 0.5f ? -std::log(p_k) : -std::log(1.0f-p_k);
+                }
+                all_dInput_fc.push_back(grad_fc);
+            }
+
+            // Backward pass
+            for(int b=0;b<currentBatchSize;b++){
+                auto dFlat = classifier.backward(all_dInput_fc[b], lr/currentBatchSize);
+                auto dConv = unflatten(dFlat, C4, feature_H, feature_W);
+
+                if(!freeze_base) {
+                    dConv = block4.backward(dConv, lr/currentBatchSize);
+                    dConv = expand4.backward(dConv, lr/currentBatchSize);
+                    dConv = downsample4.backward(dConv);
+
+                    dConv = block3.backward(dConv, lr/currentBatchSize);
+                    dConv = expand3.backward(dConv, lr/currentBatchSize);
+                    dConv = downsample3.backward(dConv);
+
+                    dConv = block2.backward(dConv, lr/currentBatchSize);
+                    dConv = expand2.backward(dConv, lr/currentBatchSize);
+                    dConv = downsample2.backward(dConv);
+
+                    dConv = block1.backward(dConv, lr/currentBatchSize);
+                    dConv = stem_ln.backward(dConv, lr/currentBatchSize);
+                    dConv = stem_conv.backward(dConv, lr/currentBatchSize);
+                }
+            }
+        }
+
+        // Epoch metrics
+        float avgLoss = totalLoss / X.size();
+        float avgAcc = 0;
+        for(size_t i=0;i<X.size();i++){
+            auto s = stem_conv.forward(X[i]);
+            s = stem_ln.forward(s);
+            s = block1.forward(s);
+            s = downsample2.forward(s);
+            s = expand2.forward(s);
+            s = block2.forward(s);
+            s = downsample3.forward(s);
+            s = expand3.forward(s);
+            s = block3.forward(s);
+            s = downsample4.forward(s);
+            s = expand4.forward(s);
+            s = block4.forward(s);
+            auto pred = classifier.forward(flatten(s), false);
+            avgAcc += multilabel_accuracy(pred,Y[i]);
+        }
+        avgAcc /= X.size();
+        cout << "Epoch " << e+1 << "/" << epochs << ": Loss = " << avgLoss << ", Accuracy = " << avgAcc << endl;
+
+        if(freeze_base)
+            cout << " [Incremental training: base frozen]" << endl;
+        else
+            cout << " [Full training: base trainable]" << endl;
+    }
+
+    // --- Save Model ---
+    stem_conv.save(modelName + "_stem_conv");
+    stem_ln.save(modelName + "_stem_ln");
+    block1.save(modelName + "_block1");
+    expand2.save(modelName + "_expand2");
+    block2.save(modelName + "_block2");
+    expand3.save(modelName + "_expand3");
+    block3.save(modelName + "_block3");
+    expand4.save(modelName + "_expand4");
+    block4.save(modelName + "_block4");
+    classifier.save(modelName + "_fc");
+    save_tags(tag2idx, modelName);
+
+    cout << "Model training complete and saved to " << modelName << "_*.bin/json\n";
+
+    return 0;
+}
