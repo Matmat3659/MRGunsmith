@@ -11,10 +11,8 @@
 #include <stdexcept>
 #include <numeric>
 #include <tuple>
-#include <iomanip> // Needed for std::fixed and std::setprecision
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
-#include <omp.h> // Include OpenMP header
 
 // Assuming these two headers are available in the build environment
 #define STB_IMAGE_IMPLEMENTATION
@@ -453,7 +451,6 @@ Tensor3f load_image_stb(const string& image_path, int target_H, int target_W) {
 // ---------------- Tag Loading ----------------
 
 map<int, string> load_tags(const string& model_dir, const string& model_name){
-    // The model_name parameter is not strictly used to build the path, but kept for context.
     string path = model_dir + "/" + "model_tags.json";
     ifstream f(path);
     if(!f.is_open()){
@@ -475,7 +472,6 @@ map<int, string> load_tags(const string& model_dir, const string& model_name){
 
     map<int, string> idx2tag;
     for(const auto& item : j.items()){
-        // Key is the tag name (string), Value is the index (integer)
         if(!item.value().is_number_integer()){
             cerr << "[WARN] Skipping invalid tag entry: " << item.key() << "\n";
             continue;
@@ -500,7 +496,6 @@ int main(int argc, char **argv){
     string modelName = "model_best"; // Use the best checkpoint by default
     int imageSize = 224; // Default input size for ConvNeXt
     int numThreads = 1; // Inference often runs faster with fewer threads
-    float confidenceThreshold = 0.0f; // NEW: Default to 0.0 (show all)
 
     for(int i=1;i<argc;i++){
         string arg=argv[i];
@@ -509,19 +504,6 @@ int main(int argc, char **argv){
         else if(arg=="--model-name" && i+1<argc){ modelName = argv[i+1]; i++; }
         else if(arg=="--size" && i+1<argc){ imageSize = stoi(argv[i+1]); i++; }
         else if(arg=="--threads" && i+1<argc){ numThreads = stoi(argv[i+1]); i++; }
-        // NEW: Threshold argument
-        else if(arg=="--threshold" && i+1<argc){ 
-            try {
-                confidenceThreshold = stof(argv[i+1]); 
-                i++; 
-                if (confidenceThreshold < 0.0f || confidenceThreshold > 1.0f) {
-                    throw std::out_of_range("Threshold must be between 0.0 and 1.0.");
-                }
-            } catch (const std::exception& e) {
-                cerr << "Error: Invalid value for --threshold. " << e.what() << endl;
-                return 1;
-            }
-        }
     }
     
     if (imagePath.empty()) {
@@ -530,7 +512,6 @@ int main(int argc, char **argv){
     }
     
     try {
-        // Set OpenMP and Eigen threads
         omp_set_num_threads(numThreads);
         Eigen::setNbThreads(numThreads);
         cout << "Using " << numThreads << " OpenMP threads for inference.\n";
@@ -615,17 +596,14 @@ int main(int argc, char **argv){
         
         // --- Process and Print Results ---
         
-        cout << "\n--- Prediction Results (Threshold: " << std::fixed << std::setprecision(4) << confidenceThreshold << ") ---\n";
+        cout << "\n--- Prediction Results ---\n";
         
-        // Create a list of {score, tag_name} pairs for results ABOVE the threshold
+        // Create a list of {score, tag_name} pairs
         vector<pair<float, string>> results;
         for(int i=0; i<pred.size(); i++){
-            float score = pred(i);
-            if(score >= confidenceThreshold){ // NEW: Apply threshold filter
-                // Check if the tag index exists (should always if loading was successful)
-                if(idx2tag.count(i)){
-                    results.push_back({score, idx2tag.at(i)});
-                }
+            // Check if the tag index exists (should always if loading was successful)
+            if(idx2tag.count(i)){
+                results.push_back({pred(i), idx2tag.at(i)});
             }
         }
         
@@ -634,15 +612,12 @@ int main(int argc, char **argv){
             return a.first > b.first;
         });
 
-        // Print ALL filtered results
-        if (results.empty()) {
-            cout << "No predictions met the confidence threshold.\n";
-        } else {
-            cout << results.size() << " predictions met the confidence threshold:\n";
-            for(const auto& res : results){
-                cout << std::fixed << std::setprecision(4) 
-                     << res.first << " : " << res.second << "\n";
-            }
+        // Print top results
+        int top_k = std::min((int)results.size(), 10);
+        cout << "Top " << top_k << " Predictions:\n";
+        for(int i=0; i<top_k; i++){
+            cout << std::fixed << std::setprecision(4) 
+                 << results[i].first << " : " << results[i].second << "\n";
         }
 
     } catch (const std::exception& e) {
