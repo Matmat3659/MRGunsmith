@@ -1,9 +1,3 @@
-#define EIGEN_NO_DEBUG
-#define EIGEN_VECTORIZE
-#define EIGEN_VECTORIZE_NEON
-#define EIGEN_MAX_ALIGN_BYTES 16
-#define EIGEN_FAST_MATH 1
-#define EIGEN_USE_OPENMP
 #include <iostream>
 #include <vector>
 #include <string>
@@ -20,10 +14,6 @@
 #include <tuple>
 #include <Eigen/Dense>
 #include <unsupported/Eigen/CXX11/Tensor>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 // Assuming these two headers are available in the build environment
 #define STB_IMAGE_IMPLEMENTATION
@@ -353,69 +343,34 @@ struct ConvLayer {
 
         Tensor3f out(numFilters, H_out, W_out);
         out.setZero();
-		
-        // Manual Forward Pass (highly parallelized)
+
         int channels_per_group = inChannels / groups;
         int filters_per_group = numFilters / groups;
-        
-        #pragma omp parallel for
-        for (int g = 0; g < groups; ++g) {
-            int c_start = g * channels_per_group;
-            int c_end = c_start + channels_per_group;
-            int f_start = g * filters_per_group;
-            int f_end = f_start + filters_per_group;
-        
-            int N = H_out * W_out;
-            int K = channels_per_group * kernelSize * kernelSize;
-        
-            Eigen::MatrixXf col(K, N);
-        
-            #pragma omp parallel for collapse(2)
-            for (int c = 0; c < channels_per_group; ++c) {
-                for (int ki = 0; ki < kernelSize; ++ki) {
-                    for (int kj = 0; kj < kernelSize; ++kj) {
-                        int k = c * kernelSize * kernelSize + ki * kernelSize + kj;
-        
-                        for (int i = 0; i < H_out; ++i) {
-                            for (int j = 0; j < W_out; ++j) {
+
+        // Manual Forward Pass (highly parallelized)
+        #pragma omp parallel for collapse(3)
+        for (int f = 0; f < numFilters; ++f) {
+            int group_idx = f / filters_per_group;
+            
+            for (int i = 0; i < H_out; ++i) {
+                for (int j = 0; j < W_out; ++j) {
+                    float sum = 0.0f;
+                    
+                    for (int c_in_g = 0; c_in_g < channels_per_group; ++c_in_g) {
+                        int c_in = group_idx * channels_per_group + c_in_g;
+                        
+                        for (int ki = 0; ki < kernelSize; ++ki) {
+                            for (int kj = 0; kj < kernelSize; ++kj) {
                                 int in_i = i * stride + ki - padding;
                                 int in_j = j * stride + kj - padding;
-                                int n = i * W_out + j;
-        
-                                float val = 0.0f;
-                                if (in_i >= 0 && in_i < H_in && in_j >= 0 && in_j < W_in)
-                                    val = input(c_start + c, in_i, in_j);
-        
-                                col(k, n) = val;
+
+                                if (in_i >= 0 && in_i < H_in && in_j >= 0 && in_j < W_in) {
+                                    sum += input(c_in, in_i, in_j) * kernels(f, c_in_g, ki, kj);
+                                }
                             }
                         }
                     }
-                }
-            }
-        
-            // Flatten filters for this group: (filters_per_group x K)
-            Eigen::MatrixXf weight(filters_per_group, K);
-            for (int f = 0; f < filters_per_group; ++f) {
-                for (int c = 0; c < channels_per_group; ++c) {
-                    for (int ki = 0; ki < kernelSize; ++ki) {
-                        for (int kj = 0; kj < kernelSize; ++kj) {
-                            int k = c * kernelSize * kernelSize + ki * kernelSize + kj;
-                            weight(f, k) = kernels(f_start + f, c, ki, kj);
-                        }
-                    }
-                }
-            }
-        
-            Eigen::MatrixXf out_mat = weight * col;
-        
-            // Copy result back to out tensor
-            #pragma omp parallel for collapse(2)
-            for (int f = 0; f < filters_per_group; ++f) {
-                for (int i = 0; i < H_out; ++i) {
-                    for (int j = 0; j < W_out; ++j) {
-                        int n = i * W_out + j;
-                        out(f_start + f, i, j) = out_mat(f, n);
-                    }
+                    out(f, i, j) = sum;
                 }
             }
         }
@@ -733,8 +688,7 @@ struct FCLayer {
 
     Vectorf forward(const Vectorf& in, bool training=true){
         lastIn = in;
-        Vectorf z = B;
-        z.noalias() += W * in;
+        Vectorf z = W * in + B;
         lastPreActivation = z;
         Vectorf out(outSize);
         dropoutMask.resize(outSize); dropoutMask.setOnes();
@@ -765,6 +719,8 @@ struct FCLayer {
 
     Vectorf backward(const Vectorf& grad, float lr, int t){
         Vectorf dInput(inSize); dInput.setZero();
+        // Matrixf dW(outSize, inSize); dW.setZero(); // Not needed as we update W directly
+        // Vectorf dB(outSize); dB.setZero(); // Not needed as we update B directly
 
         // Adam learning rate with bias correction
         float lr_t = lr * std::sqrt(1.0f - std::pow(BETA2, t)) / (1.0f - std::pow(BETA1, t));
@@ -882,54 +838,60 @@ float multilabel_accuracy(const Vectorf& pred, const Vectorf& target, float thre
 }
 
 // ---------------- Data Handling ----------------
-struct MappedDataset {
-    int N = 0, C = 0, H = 0, W = 0, num_labels = 0;
-    float* data_ptr = nullptr;
-    int fd = -1;
-    size_t file_size = 0;
 
-    Eigen::TensorMap<Tensor3f> get_tensor(int idx) {
-        size_t image_elements = (size_t)C * H * W;
-        size_t total_elements_per_entry = image_elements + num_labels;
-        // Skip the header: The header is 5 integers. 
-        // In a float* array, 5 integers occupy the same space as 5 floats.
-        float* start = data_ptr + 5 + (static_cast<size_t>(idx) * total_elements_per_entry);
-        return Eigen::TensorMap<Tensor3f>(start, C, H, W);
-    }
-
-    Eigen::Map<Vectorf> get_labels(int idx) {
-        size_t image_elements = (size_t)C * H * W;
-        size_t total_elements_per_entry = image_elements + num_labels;
-        float* start = data_ptr + 5 + (static_cast<size_t>(idx) * total_elements_per_entry) + image_elements;
-        return Eigen::Map<Vectorf>(start, num_labels);
-    }
+struct Dataset {
+    vector<Tensor3f> X;
+    vector<Vectorf> Y;
+    int N, C, H, W, num_labels;
 };
 
-MappedDataset map_dataset(const string& bin_path) {
-    MappedDataset ds;
-    ds.fd = open(bin_path.c_str(), O_RDONLY);
-    if (ds.fd == -1) throw runtime_error("Could not open file: " + bin_path);
+// Function to load the pre-processed binary dataset
+Dataset load_dataset_bin(const string& folder_path, map<string,int>& tag2idx) {
+    Dataset data;
+    string tag_file = folder_path + "/tags.json";
+    ifstream ftag(tag_file);
+    if(!ftag.is_open()){
+        cerr << "Cannot open tag file " << tag_file << "\n";
+        exit(1);
+    }
 
-    struct stat sb;
-    fstat(ds.fd, &sb);
-    ds.file_size = sb.st_size;
+    json j;
+    ftag >> j;
+    tag2idx.clear();
+    for(auto &item: j.items())
+        tag2idx[item.key()] = item.value();
+    ftag.close();
 
-    // Map the file
-    void* addr = mmap(NULL, ds.file_size, PROT_READ, MAP_PRIVATE, ds.fd, 0);
-    if (addr == MAP_FAILED) throw runtime_error("mmap failed");
+    string bin_path = folder_path + "/dataset.bin";
+    ifstream fin(bin_path, ios::binary);
+    if(!fin.is_open()){
+        cerr << "Cannot open dataset file " << bin_path << "\n";
+        exit(1);
+    }
 
-    // HEADER FIX: Interpret the first 5 slots as integers
-    int* header = static_cast<int*>(addr);
-    ds.N          = header[0];
-    ds.C          = header[1];
-    ds.H          = header[2];
-    ds.W          = header[3];
-    ds.num_labels = header[4];
+    // Read header information
+    read_bin(fin, &data.N, 1);
+    read_bin(fin, &data.C, 1);
+    read_bin(fin, &data.H, 1);
+    read_bin(fin, &data.W, 1);
+    read_bin(fin, &data.num_labels, 1);
 
-    // Data pointer starts at the same address, but we treat it as float* // for the get_tensor/get_labels offsets.
-    ds.data_ptr = static_cast<float*>(addr);
+    // Read data
+    for(int i=0;i<data.N;i++){
+        Tensor3f img(data.C, data.H, data.W);
+        Vectorf labels(data.num_labels);
+        read_bin(fin, img.data(), img.size());
+        read_bin(fin, labels.data(), labels.size());
+        data.X.push_back(std::move(img));
+        data.Y.push_back(std::move(labels));
+    }
 
-    return ds;
+    fin.close();
+    cout << "Loaded " << data.N << " images of size "
+         << data.C << "x" << data.H << "x" << data.W
+         << " with " << data.num_labels << " labels.\n";
+
+    return data;
 }
 
 void save_tags(const map<string,int>& tag2idx, const string& prefix){
@@ -961,7 +923,7 @@ void save_tags(const map<string,int>& tag2idx, const string& prefix){
 }
 
 void load_tags(map<string,int>& tag2idx, const string& prefix){
-    string path = prefix + "tags.json";
+    string path = prefix + "_tags.json";
     ifstream f(path);
     if(!f.is_open()){
         cerr << "[ERROR] Cannot open tag file: " << path << "\n";
@@ -1084,53 +1046,12 @@ std::pair<float, float> evaluate_model(
 }
 
 // ---------------- Main Training Function ----------------
-std::pair<float, float> evaluate_model(
-    MappedDataset& ds, const std::vector<int>& indices,
-    ConvLayer& stem_conv, LayerNorm& stem_ln, ConvNeXtBlock& block1, MaxPool& downsample2,
-    ConvLayer& expand2, ConvNeXtBlock& block2, MaxPool& downsample3, ConvLayer& expand3,
-    ConvNeXtBlock& block3, MaxPool& downsample4, ConvLayer& expand4, ConvNeXtBlock& block4,
-    GlobalAvgPool& gap, FCLayer& classifier)
-{
-    float totalLoss = 0.0f;
-    float totalAcc = 0.0f;
-    size_t count = indices.size();
 
-    #pragma omp parallel for reduction(+:totalLoss, totalAcc)
-    for(size_t i = 0; i < count; i++) {
-        int idx = indices[i];
-        auto img = ds.get_tensor(idx);
-        auto label = ds.get_labels(idx);
-
-        auto s = stem_conv.forward(img);
-        s = stem_ln.forward(s);
-        s = block1.forward(s);
-        s = downsample2.forward(s);
-        s = expand2.forward(s);
-        s = block2.forward(s);
-        s = downsample3.forward(s);
-        s = expand3.forward(s);
-        s = block3.forward(s);
-        s = downsample4.forward(s);
-        s = expand4.forward(s);
-        s = block4.forward(s);
-
-        Vectorf pooled = gap.forward(s);
-        Vectorf pred = classifier.forward(pooled, false);
-
-        for(int k = 0; k < pred.size(); k++){
-            float p_k = std::clamp(pred(k), 1e-7f, 1.0f - 1e-7f);
-            totalLoss += label(k) > 0.5f ? -std::log(p_k) : -std::log(1.0f - p_k);
-        }
-        totalAcc += multilabel_accuracy(pred, label);
-    }
-    return {totalLoss / count, totalAcc / count};
-}
-
-int main(int argc, char **argv) {
+int main(int argc,char **argv){
     srand(time(0));
     random_device rd; mt19937 g(rd());
 
-    map<string, int> tag2idx;
+    map<string,int> tag2idx;
 
     // --- Training Configuration ---
     string dataFolder = "Data";
@@ -1138,13 +1059,13 @@ int main(int argc, char **argv) {
     string loadModelName = "";
     bool freeze_base = false;
     int epochs = 50;
-    float base_lr = 0.0005f;
+    float base_lr = 0.0005f; 
     int batchSize = 2;
     int numThreads = 4;
-    float warmup_epochs = 5.0f; 
-    float val_ratio = 0.2f; 
+    float warmup_epochs = 5.0f; // 5 epochs of linear warmup
+    float val_ratio = 0.2f; // 20% for validation
 
-    for(int i=1; i<argc; i++){
+    for(int i=1;i<argc;i++){
         string arg=argv[i];
         if(arg=="--data" && i+1<argc){ dataFolder = argv[i+1]; i++; }
         else if(arg=="--model-name" && i+1<argc){ modelName = argv[i+1]; i++; }
@@ -1164,31 +1085,41 @@ int main(int argc, char **argv) {
     cout << "Batch size set to: " << batchSize << endl;
     cout << "Base LR: " << base_lr << ", Warmup Epochs: " << warmup_epochs << ", Total Epochs: " << epochs << endl;
 
-    // --- Mmap Data Loading ---
-    string bin_path = dataFolder + "/dataset.bin";
-    MappedDataset ds;
-    try {
-        ds = map_dataset(bin_path);
-    } catch (const exception& e) {
-        cerr << "Error: " << e.what() << endl;
+    cout << "Loading dataset from folder: " << dataFolder << "\n";
+    Dataset full_data = load_dataset_bin(dataFolder, tag2idx);
+
+    if (full_data.X.empty()) {
+        cerr << "Error: No data loaded. Exiting.\n";
         return 1;
     }
 
-    load_tags(tag2idx, dataFolder + "/");
-
-    // --- Data Splitting (Indices only) ---
-    vector<int> all_indices(ds.N);
+    // --- Data Splitting ---
+    vector<Tensor3f> train_X, val_X;
+    vector<Vectorf> train_Y, val_Y;
+    
+    vector<int> all_indices(full_data.N);
     iota(all_indices.begin(), all_indices.end(), 0);
     shuffle(all_indices.begin(), all_indices.end(), g);
 
-    size_t val_size = static_cast<size_t>(ds.N * val_ratio);
-    size_t train_size = ds.N - val_size;
+    size_t val_size = static_cast<size_t>(full_data.N * val_ratio);
+    size_t train_size = full_data.N - val_size;
+    
+    cout << "Splitting data: Train size = " << train_size << ", Validation size = " << val_size << endl;
 
-    vector<int> train_indices(all_indices.begin(), all_indices.begin() + train_size);
-    vector<int> val_indices(all_indices.begin() + train_size, all_indices.end());
+    for (size_t i = 0; i < full_data.N; ++i) {
+        if (i < train_size) {
+            train_X.push_back(std::move(full_data.X[all_indices[i]]));
+            train_Y.push_back(std::move(full_data.Y[all_indices[i]]));
+        } else {
+            val_X.push_back(std::move(full_data.X[all_indices[i]]));
+            val_Y.push_back(std::move(full_data.Y[all_indices[i]]));
+        }
+    }
+    
+    // Release full_data memory
+    full_data.X.clear();
+    full_data.Y.clear();
 
-    cout << "Memory Mapped: " << ds.N << " images ready." << endl;
-    cout << "Train size = " << train_size << ", Val size = " << val_size << endl;
 
     // --- ConvNeXt Tiny-like Architecture Channels ---
     const int C1 = 64;
@@ -1196,46 +1127,64 @@ int main(int argc, char **argv) {
     const int C3 = 256;
     const int C4 = 512;
 
-    // --- Model Definition (Using ds instead of full_data) ---
-    ConvLayer stem_conv(ds.C, 4, C1, Activation::IDENTITY, 4, 0, 1);
+    // --- Model Definition ---
+    // 1. Stem: 4x4, stride 4
+    ConvLayer stem_conv(full_data.C, 4, C1, Activation::IDENTITY, 4, 0, 1);
     LayerNorm stem_ln(C1);
+    
+    // 2. Stage 1 (Resolution / 4)
     ConvNeXtBlock block1(C1);
+
+    // 3. Stage 2 Downsampling (Resolution / 8)
     MaxPool downsample2(2, 2);
     ConvLayer expand2(C1, 1, C2, Activation::IDENTITY, 1, 0, 1);
     ConvNeXtBlock block2(C2);
+
+    // 4. Stage 3 Downsampling (Resolution / 16)
     MaxPool downsample3(2, 2);
     ConvLayer expand3(C2, 1, C3, Activation::IDENTITY, 1, 0, 1);
     ConvNeXtBlock block3(C3);
+
+    // 5. Stage 4 Downsampling (Resolution / 32)
     MaxPool downsample4(2, 2);
     ConvLayer expand4(C3, 1, C4, Activation::IDENTITY, 1, 0, 1);
     ConvNeXtBlock block4(C4);
 
+    // 6. Head
     GlobalAvgPool gap;
-    FCLayer classifier(C4, tag2idx.size(), Activation::SIGMOID, 0.2f); 
+    int fcInputSize = C4;
 
+    FCLayer classifier(fcInputSize, tag2idx.size(), Activation::SIGMOID, 0.2f); // Add 20% Dropout
+
+    // --- Model Loading ---
     if (!loadModelName.empty()) {
         cout << "Loading model weights from " << loadModelName << "...\n";
         load_all_weights(loadModelName, stem_conv, stem_ln, block1, expand2, block2, expand3, block3, expand4, block4, classifier);
     }
-
+    
+    // --- Checkpointing variables ---
     float best_val_acc = -1.0f;
-    long long global_step = 1;
+
 
     // --- Training Loop ---
+    long long global_step = 1;
+
     for(int e=0; e<epochs; e++){
+        // Calculate Learning Rate using Cosine Annealing Schedule
         float lr_epoch = cosine_annealing_lr(base_lr, e, epochs, warmup_epochs);
-        float epochLoss = 0;
 
-        shuffle(train_indices.begin(), train_indices.end(), g);
+        float totalLoss = 0;
 
-        for(size_t i = 0; i < train_indices.size(); i += batchSize) {
-            for(int b = 0; b < batchSize && i + b < train_indices.size(); b++) {
-                int idx = train_indices[i + b];
-                auto img = ds.get_tensor(idx);
-                auto label = ds.get_labels(idx);
+        vector<int> indices(train_X.size());
+        iota(indices.begin(), indices.end(), 0);
+        shuffle(indices.begin(), indices.end(), g);
 
-                // Forward
-                auto s = stem_conv.forward(img);
+        for(size_t i=0;i<train_X.size();i+=batchSize){
+            for(int b=0;b<batchSize && i+b<train_X.size();b++){
+                int idx = indices[i+b];
+
+                // --- Forward Pass (Training Mode) ---
+                auto s = stem_conv.forward(train_X[idx]);
                 s = stem_ln.forward(s);
                 s = block1.forward(s);
                 s = downsample2.forward(s);
@@ -1247,60 +1196,83 @@ int main(int argc, char **argv) {
                 s = downsample4.forward(s);
                 s = expand4.forward(s);
                 s = block4.forward(s);
-
+                
+                // Head
                 Vectorf pooled = gap.forward(s);
-                Vectorf pred = classifier.forward(pooled, true);
+                Vectorf pred = classifier.forward(pooled, true); // Training=true
 
-                // Loss
-                Vectorf grad_fc = BCE_grad(pred, label);
-                for(int k = 0; k < pred.size(); k++) {
-                    float p_k = std::clamp(pred(k), 1e-7f, 1.0f - 1e-7f);
-                    epochLoss += label(k) > 0.5f ? -std::log(p_k) : -std::log(1.0f - p_k);
+                // --- Loss and Gradient Calculation ---
+                Vectorf grad_fc = BCE_grad(pred, train_Y[idx]);
+                
+                // Accumulate Loss
+                for(int k=0;k<pred.size();k++){
+                    float p_k = std::clamp(pred(k), 1e-7f, 1.0f-1e-7f);
+                    totalLoss += train_Y[idx](k) > 0.5f ? -std::log(p_k) : -std::log(1.0f-p_k);
                 }
-
-                // Backward
-                global_step++;
-                int current_H = s.dimension(1);
-                int current_W = s.dimension(2);
+                
+                // --- Backward Pass and Update ---
+                int H = s.dimension(1);
+                int W = s.dimension(2);
+                
+                global_step++; // Increment step for Adam's bias correction
 
                 Vectorf dPooled = classifier.backward(grad_fc, lr_epoch, global_step);
-                Tensor3f dConv = gap.backward(dPooled, current_H, current_W);
+                Tensor3f dConv = gap.backward(dPooled, H, W);
 
                 if(!freeze_base) {
                     dConv = block4.backward(dConv, lr_epoch, global_step);
                     dConv = expand4.backward(dConv, lr_epoch, global_step);
                     dConv = downsample4.backward(dConv);
+
                     dConv = block3.backward(dConv, lr_epoch, global_step);
                     dConv = expand3.backward(dConv, lr_epoch, global_step);
                     dConv = downsample3.backward(dConv);
+
                     dConv = block2.backward(dConv, lr_epoch, global_step);
                     dConv = expand2.backward(dConv, lr_epoch, global_step);
                     dConv = downsample2.backward(dConv);
+
                     dConv = block1.backward(dConv, lr_epoch, global_step);
                     dConv = stem_ln.backward(dConv, lr_epoch, global_step);
                     dConv = stem_conv.backward(dConv, lr_epoch, global_step);
                 }
             }
         }
-
+        
         // --- End of Epoch Evaluation ---
-        auto train_metrics = evaluate_model(ds, train_indices, stem_conv, stem_ln, block1, downsample2, expand2, block2, downsample3, expand3, block3, downsample4, expand4, block4, gap, classifier);
-        auto val_metrics = evaluate_model(ds, val_indices, stem_conv, stem_ln, block1, downsample2, expand2, block2, downsample3, expand3, block3, downsample4, expand4, block4, gap, classifier);
+        
+        // 1. Evaluate on Training Set
+        std::pair<float, float> train_metrics = evaluate_model(train_X, train_Y, stem_conv, stem_ln, block1, downsample2, expand2, block2, downsample3, expand3, block3, downsample4, expand4, block4, gap, classifier);
+        float train_loss = train_metrics.first;
+        float train_acc = train_metrics.second;
 
-        cout << "Epoch " << e+1 << "/" << epochs << " | Train Loss: " << train_metrics.first << " Acc: " << train_metrics.second 
-             << " | Val Loss: " << val_metrics.first << " Acc: " << val_metrics.second << endl;
+        // 2. Evaluate on Validation Set
+        std::pair<float, float> val_metrics = evaluate_model(val_X, val_Y, stem_conv, stem_ln, block1, downsample2, expand2, block2, downsample3, expand3, block3, downsample4, expand4, block4, gap, classifier);
+        float val_loss = val_metrics.first;
+        float val_acc = val_metrics.second;
 
-        if (val_metrics.second > best_val_acc) {
-            best_val_acc = val_metrics.second;
-            cout << " *** New Best Val Acc! Saving... ***" << endl;
+        // --- Print Epoch Results ---
+        cout << "Epoch " << e+1 << "/" << epochs << ": LR = " << lr_epoch << " | Train Loss = " << train_loss 
+             << ", Train Acc = " << train_acc << " | Val Loss = " << val_loss << ", Val Acc = " << val_acc << endl;
+        
+        if(freeze_base)
+            cout << " [Incremental training: base frozen]" << endl;
+
+        // 3. Checkpointing
+        if (val_acc > best_val_acc) {
+            best_val_acc = val_acc;
+            cout << " *** New best validation accuracy: " << best_val_acc << ". Saving checkpoint: " << modelName << "_best.bin files ***" << endl;
             save_all_weights(modelName + "_best", stem_conv, stem_ln, block1, expand2, block2, expand3, block3, expand4, block4, classifier);
         }
     }
 
+    // --- Save Final Model ---
+    cout << "Saving final model as " << modelName << "_final.bin files...\n";
     save_all_weights(modelName + "_final", stem_conv, stem_ln, block1, expand2, block2, expand3, block3, expand4, block4, classifier);
+
+    // --- After training loop ends ---
+    cout << "Saving tags...\n";
     save_tags(tag2idx, modelName);
-    
-    munmap(ds.data_ptr, ds.file_size);
-    close(ds.fd);
+
     return 0;
 }
